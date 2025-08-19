@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-SIGTRAN Server with MAP SRI-SM Support
+Enhanced SIGTRAN Server with MAP SRI-SM Support
 Handles MAP Send Routing Info for Short Message requests
-Supports M3UA/SCCP/TCAP/MAP protocol stack
+Supports M3UA/SCCP/TCAP/MAP protocol stack with IMSI and NNN response
 Requires root privileges for native SCTP
 """
 
@@ -18,6 +18,7 @@ from datetime import datetime
 
 # SCTP Protocol Number
 IPPROTO_SCTP = 132
+SCCP_XUDT = 0x11       # Extended Unitdata
 
 # Configuration
 CONFIG = {
@@ -28,6 +29,9 @@ CONFIG = {
     'route_context': 12092,
     'ssn': 6,  # HLR SSN
     'network_indicator': 2,  # International network
+    'hlr_gt': '61418079999',  # HLR Global Title
+    'msc_gt': '61418080001',  # MSC Global Title for NNN
+    'vlr_gt': '61418080002',  # VLR Global Title
 }
 
 # M3UA Message Classes
@@ -82,6 +86,14 @@ TCAP_ABORT = 0x67
 MAP_SRI_SM = 45        # Send Routing Info for SM
 MAP_SRI_SM_RESP = 45   # Same opcode for response
 
+# ASN.1 Tags
+ASN1_SEQUENCE = 0x30
+ASN1_CONTEXT_0 = 0x80
+ASN1_CONTEXT_1 = 0x81
+ASN1_CONTEXT_2 = 0x82
+ASN1_INTEGER = 0x02
+ASN1_OCTET_STRING = 0x04
+
 class M3UAMessage:
     """M3UA Message Structure"""
     def __init__(self, version=1, msg_class=0, msg_type=0, length=8, data=b''):
@@ -128,7 +140,6 @@ class M3UAParameter:
             return None, 0
         
         tag, length = struct.unpack('!HH', data[:4])
-        print(f"DEBUG: M3UAParameter.unpack tag=0x{tag:04X}, length={length}")
         if length < 4:
             return None, 0
             
@@ -186,7 +197,7 @@ class SCCPAddress:
         return struct.pack('!B', len(addr_data)) + addr_data
 
 class MAPSIGTRANServer:
-    """SIGTRAN Server with MAP SRI-SM Support"""
+    """Enhanced SIGTRAN Server with MAP SRI-SM Support"""
     
     def __init__(self, host='0.0.0.0', port=2915):
         self.host = host
@@ -195,14 +206,22 @@ class MAPSIGTRANServer:
         self.running = False
         self.asp_states = {}
         self.transaction_id = 1
+        self.active_transactions = {}
         
-        # Setup logging
+        # Setup logging with more detail
         logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
+            level=logging.DEBUG,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
         self.logger = logging.getLogger('MAPSIGTRANServer')
+        
+        # Create file handler for detailed logging
+        fh = logging.FileHandler('map_sigtran_server.log')
+        fh.setLevel(logging.DEBUG)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        fh.setFormatter(formatter)
+        self.logger.addHandler(fh)
         
         # Check root privileges
         if os.geteuid() != 0:
@@ -210,16 +229,22 @@ class MAPSIGTRANServer:
             self.logger.error("Please run with: sudo python3 " + sys.argv[0])
             sys.exit(1)
         
-        self.logger.info(f"Configuration:")
+        self.logger.info("=" * 60)
+        self.logger.info("MAP SIGTRAN Server Configuration:")
         self.logger.info(f"  Local GT: {CONFIG['local_gt']}, PC: {CONFIG['local_pc']}")
         self.logger.info(f"  Remote GT: {CONFIG['remote_gt']}, PC: {CONFIG['remote_pc']}")
         self.logger.info(f"  Route Context: {CONFIG['route_context']}")
+        self.logger.info(f"  HLR GT: {CONFIG['hlr_gt']}")
+        self.logger.info(f"  MSC GT: {CONFIG['msc_gt']}")
+        self.logger.info(f"  VLR GT: {CONFIG['vlr_gt']}")
+        self.logger.info("=" * 60)
     
     def check_sctp_support(self):
         """Check if kernel supports SCTP"""
         try:
             test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, IPPROTO_SCTP)
             test_sock.close()
+            self.logger.info("SCTP support verified")
             return True
         except (OSError, socket.error) as e:
             self.logger.error(f"SCTP not supported: {e}")
@@ -231,6 +256,7 @@ class MAPSIGTRANServer:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, IPPROTO_SCTP)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            #sock.settimeout(1.0)  # Set timeout for non-blocking operations
             self.logger.info("Created native SCTP socket")
             return sock
         except Exception as e:
@@ -266,96 +292,19 @@ class MAPSIGTRANServer:
                           msg_type=resp_type, length=msg_length, 
                           data=param_data)
     
-    def encode_gt_digits(self, gt_string):
-        """Encode GT digits in BCD format"""
-        digits = gt_string
-        if len(digits) % 2:
-            digits += 'F'
-        
-        encoded = b''
-        for i in range(0, len(digits), 2):
-            d1 = int(digits[i+1] if i+1 < len(gt_string) else 15)
-            d2 = int(digits[i])
-            encoded += struct.pack('!B', (d1 << 4) | d2)
-        
-        return encoded
-    
-    def create_sri_sm_response(self, invoke_id, msisdn):
-        """Create MAP SRI-SM Response with proper ASN.1 encoding"""
-        self.logger.info(f"Creating SRI-SM Response for MSISDN: {msisdn}, Invoke ID: {invoke_id}")
-        
-        # Encode Network Node Number (NNN) as AddressString
-        nnn_digits = CONFIG['local_gt']
-        # TON/NPI byte: International number (001) + ISDN numbering (0001) = 0x91
-        ton_npi = 0x91
-        nnn_bcd = self.encode_bcd_digits(nnn_digits)
-        nnn_address_string = bytes([ton_npi]) + nnn_bcd
-        
-        # LocationInfoWithLMSI ::= SEQUENCE
-        location_info_elements = []
-        
-        # networkNode-Number [0] ISDN-AddressString
-        nnn_element = self.encode_asn1_tag_length(0x80, nnn_address_string)  # Context [0] IMPLICIT
-        location_info_elements.append(nnn_element)
-        
-        # lmsi [1] LMSI OPTIONAL (4 bytes)
-        lmsi_value = struct.pack('!I', 0x12345678)
-        lmsi_element = self.encode_asn1_tag_length(0x81, lmsi_value)  # Context [1] IMPLICIT
-        location_info_elements.append(lmsi_element)
-        
-        # Assemble LocationInfoWithLMSI SEQUENCE
-        location_info_data = b''.join(location_info_elements)
-        location_info = self.encode_asn1_tag_length(0x30, location_info_data)  # SEQUENCE
-        
-        # TCAP ReturnResult Parameter
-        # parameter [0] EXPLICIT (contains the LocationInfoWithLMSI)
-        parameter = self.encode_asn1_tag_length(0xA0, location_info)
-        
-        # operationCode INTEGER
-        op_code = self.encode_asn1_tag_length(0x02, bytes([MAP_SRI_SM_RESP]))
-        
-        # invokeId INTEGER
-        invoke_id_encoded = self.encode_asn1_tag_length(0x02, bytes([invoke_id]))
-        
-        # ReturnResult SEQUENCE
-        return_result_data = invoke_id_encoded + op_code + parameter
-        return_result = self.encode_asn1_tag_length(0x30, return_result_data)
-        
-        # Component [2] ReturnResult
-        component = self.encode_asn1_tag_length(0xA2, return_result)
-        
-        # TCAP End with components
-        tcap_components = component
-        
-        # otid (Originating Transaction ID) - echo back the client's dtid
-        otid = self.encode_asn1_tag_length(0x48, bytes([0x12, 0x34, 0x56, 0x78]))  # Example OTID
-        
-        # TCAP End SEQUENCE  
-        tcap_end_data = otid + tcap_components
-        tcap_end = self.encode_asn1_tag_length(TCAP_END, tcap_end_data)
-        
-        self.logger.info(f"Created TCAP End message: {len(tcap_end)} bytes")
-        self.logger.info(f"SRI-SM Response hex: {tcap_end[:50].hex()}")
-        
-        return tcap_end
-    
-    def encode_asn1_tag_length(self, tag, data):
-        """Encode ASN.1 TLV structure"""
-        length = len(data)
-        if length < 0x80:
-            # Short form
-            return bytes([tag, length]) + data
-        else:
-            # Long form
-            length_bytes = []
-            temp_length = length
-            while temp_length > 0:
-                length_bytes.insert(0, temp_length & 0xFF)
-                temp_length >>= 8
-            return bytes([tag, 0x80 | len(length_bytes)]) + bytes(length_bytes) + data
+    def generate_imsi(self, msisdn):
+        """Generate IMSI based on MSISDN"""
+        # Extract country and network codes from MSISDN
+        # For demonstration, generate a realistic IMSI
+        mcc = "614"  # Australia
+        mnc = "18"   # Sample network
+        msin = msisdn[-10:].zfill(10)  # Take last 10 digits, pad with zeros if needed
+        imsi = mcc + mnc + msin
+        self.logger.info(f"Generated IMSI: {imsi} from MSISDN: {msisdn}")
+        return imsi
     
     def encode_bcd_digits(self, digits_str):
-        """Encode decimal digits in BCD format (proper BCD encoding)"""
+        """Encode decimal digits in BCD format (nibble swapped)"""
         digits = digits_str
         if len(digits) % 2:
             digits += 'F'  # Pad with F for odd length
@@ -367,145 +316,449 @@ class MAPSIGTRANServer:
             d2 = int(digits[i+1]) if i+1 < len(digits_str) and digits[i+1] != 'F' else 15
             encoded += struct.pack('!B', (d2 << 4) | d1)
         
+        self.logger.debug(f"Encoded BCD '{digits_str}' -> {encoded.hex()}")
         return encoded
     
-    def parse_sri_sm_request(self, sccp_data):
-        """Parse SRI-SM request from SCCP data with detailed logging"""
+    def encode_asn1_tag_length(self, tag, data):
+        """Encode ASN.1 TLV structure"""
+        length = len(data)
+        if length < 0x80:
+            # Short form
+            result = bytes([tag, length]) + data
+        else:
+            # Long form
+            length_bytes = []
+            temp_length = length
+            while temp_length > 0:
+                length_bytes.insert(0, temp_length & 0xFF)
+                temp_length >>= 8
+            result = bytes([tag, 0x80 | len(length_bytes)]) + bytes(length_bytes) + data
+        
+        self.logger.debug(f"ASN.1 TLV: tag=0x{tag:02X}, length={length}, data={data.hex()[:40]}...")
+        return result
+    
+    def create_sri_sm_response(self, invoke_id, msisdn, orig_transaction_id):
+        """Create enhanced MAP SRI-SM Response with NNN and IMSI"""
+        self.logger.info("=" * 50)
+        self.logger.info(f"Creating SRI-SM Response:")
+        self.logger.info(f"  MSISDN: {msisdn}")
+        self.logger.info(f"  Invoke ID: {invoke_id}")
+        self.logger.info(f"  Original Transaction ID: {orig_transaction_id.hex() if orig_transaction_id else 'None'}")
+        
+        # Generate IMSI for this MSISDN
+        imsi = self.generate_imsi(msisdn)
+        
+        # Encode Network Node Number (MSC GT)
+        nnn_gt = CONFIG['msc_gt']
+        self.logger.info(f"  NNN (MSC GT): {nnn_gt}")
+        
+        # TON/NPI byte: International number (001) + ISDN numbering (0001) = 0x91
+        ton_npi = 0x91
+        nnn_bcd = self.encode_bcd_digits(nnn_gt)
+        nnn_address_string = bytes([ton_npi]) + nnn_bcd
+        self.logger.debug(f"  NNN AddressString: {nnn_address_string.hex()}")
+        
+        # Encode IMSI
+        imsi_bcd = self.encode_bcd_digits(imsi)
+        self.logger.debug(f"  IMSI BCD: {imsi_bcd.hex()}")
+        
+        # Create LMSI (4 bytes)
+        lmsi_value = struct.pack('!I', random.randint(0x10000000, 0xFFFFFFFF))
+        self.logger.debug(f"  LMSI: {lmsi_value.hex()}")
+        
+        # LocationInfoWithLMSI ::= SEQUENCE {
+        #   networkNode-Number  [0] ISDN-AddressString,
+        #   lmsi                [1] LMSI OPTIONAL,
+        #   ... }
+        location_info_elements = []
+        
+        # networkNode-Number [0] ISDN-AddressString (IMPLICIT)
+        nnn_element = self.encode_asn1_tag_length(ASN1_CONTEXT_0, nnn_address_string)
+        location_info_elements.append(nnn_element)
+        self.logger.debug(f"  NNN Element: {nnn_element.hex()}")
+        
+        # lmsi [1] LMSI OPTIONAL (IMPLICIT)
+        lmsi_element = self.encode_asn1_tag_length(ASN1_CONTEXT_1, lmsi_value)
+        location_info_elements.append(lmsi_element)
+        self.logger.debug(f"  LMSI Element: {lmsi_element.hex()}")
+        
+        # Assemble LocationInfoWithLMSI SEQUENCE
+        location_info_data = b''.join(location_info_elements)
+        location_info = self.encode_asn1_tag_length(ASN1_SEQUENCE, location_info_data)
+        self.logger.debug(f"  LocationInfo: {location_info.hex()}")
+        
+        # Add IMSI as additional info [2] IMSI OPTIONAL
+        imsi_element = self.encode_asn1_tag_length(ASN1_CONTEXT_2, imsi_bcd)
+        location_info_with_imsi = location_info_data + imsi_element
+        location_info_complete = self.encode_asn1_tag_length(ASN1_SEQUENCE, location_info_with_imsi)
+        self.logger.debug(f"  LocationInfo with IMSI: {location_info_complete.hex()}")
+        
+        # TCAP ReturnResult Parameter (EXPLICIT)
+        parameter = self.encode_asn1_tag_length(0xA0, location_info_complete)
+        
+        # operationCode INTEGER
+        op_code = self.encode_asn1_tag_length(ASN1_INTEGER, bytes([MAP_SRI_SM_RESP]))
+        
+        # invokeId INTEGER
+        invoke_id_encoded = self.encode_asn1_tag_length(ASN1_INTEGER, bytes([invoke_id & 0xFF]))
+        
+        # ReturnResult SEQUENCE
+        return_result_data = invoke_id_encoded + op_code + parameter
+        return_result = self.encode_asn1_tag_length(ASN1_SEQUENCE, return_result_data)
+        
+        # Component [2] ReturnResult
+        component = self.encode_asn1_tag_length(0xA2, return_result)
+        
+        # otid (Originating Transaction ID) - echo back or generate new
+        if orig_transaction_id and len(orig_transaction_id) >= 4:
+            otid_value = orig_transaction_id
+        else:
+            otid_value = struct.pack('!I', random.randint(0x10000000, 0xFFFFFFFF))
+        
+        otid = self.encode_asn1_tag_length(0x48, otid_value)
+        
+        # TCAP End SEQUENCE  
+        tcap_end_data = otid + component
+        tcap_end = self.encode_asn1_tag_length(TCAP_END, tcap_end_data)
+        
+        self.logger.info(f"  TCAP End message created: {len(tcap_end)} bytes")
+        self.logger.debug(f"  Complete TCAP End: {tcap_end.hex()}")
+        self.logger.info("=" * 50)
+        
+        return tcap_end
+    
+    def decode_bcd_digits(self, bcd_data):
+        """Decode BCD encoded digits with detailed logging"""
         try:
-            self.logger.info(f"Parsing SCCP data: {len(sccp_data)} bytes")
-            self.logger.info(f"SCCP hex dump: {sccp_data[:50].hex()}")
-            self.logger.debug(f"Full SCCP data: {sccp_data.hex()}")
-
-            invoke_id = 1
-            msisdn = None
-
-            for i in range(len(sccp_data) - 10):
-                if sccp_data[i] == 0x02 and sccp_data[i+1] == 0x01:
-                    invoke_id = sccp_data[i+2]
-                    self.logger.info(f"Found TCAP invoke ID: {invoke_id} at offset {i}")
-                    self.logger.debug(f"Invoke ID bytes: {sccp_data[i:i+3].hex()}")
-
-                if sccp_data[i] == 0x02 and sccp_data[i+1] == 0x01 and sccp_data[i+2] == 0x2D:
-                    self.logger.info("Found MAP SRI-SM operation code (45) at offset {i}")
-                    self.logger.debug(f"Operation code bytes: {sccp_data[i:i+3].hex()}")
-
-                if sccp_data[i] == 0x80:
-                    length = sccp_data[i + 1]
-                    self.logger.debug(f"Context [0] IMPLICIT tag at offset {i}, length {length}")
-                    if 3 <= length <= 15:
-                        msisdn_bcd = sccp_data[i + 2:i + 2 + length]
-                        self.logger.debug(f"MSISDN BCD bytes: {msisdn_bcd.hex()}")
-                        msisdn = self.decode_bcd_msisdn(msisdn_bcd)
-                        self.logger.info(f"Found MSISDN (pattern 1): {msisdn}")
-                        break
-
-                if sccp_data[i] == 0x81:
-                    length = sccp_data[i + 1]
-                    self.logger.debug(f"Context [1] IMPLICIT tag at offset {i}, length {length}")
-                    if 3 <= length <= 15:
-                        msisdn_bcd = sccp_data[i + 2:i + 2 + length]
-                        self.logger.debug(f"MSISDN BCD bytes: {msisdn_bcd.hex()}")
-                        msisdn = self.decode_bcd_msisdn(msisdn_bcd)
-                        self.logger.info(f"Found MSISDN (pattern 2): {msisdn}")
-                        break
-
-                if sccp_data[i] == 0x04:
-                    length = sccp_data[i + 1]
-                    self.logger.debug(f"OCTET STRING tag at offset {i}, length {length}")
-                    if 4 <= length <= 16:
-                        if i + 3 < len(sccp_data):
-                            msisdn_bcd = sccp_data[i + 3:i + 2 + length]
-                            self.logger.debug(f"MSISDN BCD bytes: {msisdn_bcd.hex()}")
-                            msisdn = self.decode_bcd_msisdn(msisdn_bcd)
-                            self.logger.info(f"Found MSISDN (pattern 3): {msisdn}")
-                            break
-
-            if not msisdn:
-                msisdn = CONFIG['remote_gt']
-                self.logger.warning(f"MSISDN not found in request, using remote GT: {msisdn}")
-
-            return msisdn, invoke_id
-
-        except Exception as e:
-            self.logger.error(f"Error parsing SRI-SM request: {e}")
-            return CONFIG['remote_gt'], 1
-
-    def decode_bcd_msisdn(self, bcd_data):
-        """Decode BCD encoded MSISDN"""
-        try:
-            self.logger.debug(f"Decoding BCD MSISDN: {bcd_data.hex()}")
-            msisdn = ""
-            for byte in bcd_data:
+            self.logger.debug(f"Decoding BCD data: {bcd_data.hex()}")
+            digits = ""
+            for i, byte in enumerate(bcd_data):
                 d1 = byte & 0x0F
                 d2 = (byte >> 4) & 0x0F
-                self.logger.debug(f"BCD byte: {byte:02x}, d1: {d1}, d2: {d2}")
+                self.logger.debug(f"  Byte {i}: 0x{byte:02X} -> d1={d1}, d2={d2}")
+                if d1 != 15:  # 15 = 0xF (filler)
+                    digits += str(d1)
                 if d2 != 15:
-                    msisdn = str(d2) + msisdn
-                if d1 != 15:
-                    msisdn = str(d1) + msisdn
-            self.logger.debug(f"Decoded MSISDN (reversed): {msisdn[::-1]}")
-            return msisdn[::-1] if msisdn else None
+                    digits += str(d2)
+            self.logger.debug(f"Decoded digits: '{digits}'")
+            return digits if digits else None
         except Exception as e:
-            self.logger.error(f"Error decoding BCD MSISDN: {e}")
+            self.logger.error(f"Error decoding BCD digits: {e}")
             return None
     
+    def parse_sccp_addresses(self, sccp_data, offset):
+        """Parse SCCP addresses with enhanced logging"""
+        addresses = {'called': {}, 'calling': {}}
+        
+        try:
+            if offset + 3 >= len(sccp_data):
+                self.logger.error("SCCP data too short for address parsing")
+                return addresses, offset
+            
+            # Get pointers
+            ptr_called = sccp_data[offset]
+            ptr_calling = sccp_data[offset + 1] 
+            ptr_data = sccp_data[offset + 2]
+            
+            self.logger.debug(f"SCCP Address Pointers: Called={ptr_called}, Calling={ptr_calling}, Data={ptr_data}")
+            
+            # Parse Called Party Address
+            called_addr_start = offset + ptr_called
+            if called_addr_start < len(sccp_data):
+                called_addr_len = sccp_data[called_addr_start]
+                self.logger.debug(f"Called Address Length: {called_addr_len}")
+                
+                if called_addr_start + called_addr_len < len(sccp_data):
+                    called_addr_data = sccp_data[called_addr_start + 1:called_addr_start + 1 + called_addr_len]
+                    addresses['called'] = self.parse_single_sccp_address(called_addr_data, "Called")
+            
+            # Parse Calling Party Address
+            calling_addr_start = offset + ptr_calling
+            if calling_addr_start < len(sccp_data):
+                calling_addr_len = sccp_data[calling_addr_start]
+                self.logger.debug(f"Calling Address Length: {calling_addr_len}")
+                
+                if calling_addr_start + calling_addr_len < len(sccp_data):
+                    calling_addr_data = sccp_data[calling_addr_start + 1:calling_addr_start + 1 + calling_addr_len]
+                    addresses['calling'] = self.parse_single_sccp_address(calling_addr_data, "Calling")
+            
+            # Return data start position
+            data_start = offset + ptr_data
+            return addresses, data_start
+            
+        except Exception as e:
+            self.logger.error(f"Error parsing SCCP addresses: {e}")
+            return addresses, offset
+    
+    def parse_single_sccp_address(self, addr_data, addr_type):
+        """Parse a single SCCP address"""
+        address = {'gt': None, 'pc': None, 'ssn': None}
+        
+        try:
+            if len(addr_data) < 1:
+                return address
+                
+            ai = addr_data[0]  # Address Indicator
+            self.logger.debug(f"{addr_type} Address Indicator: 0x{ai:02X}")
+            
+            offset = 1
+            
+            # Point Code
+            if ai & SCCP_AI_PC_PRESENT:
+                if offset + 2 <= len(addr_data):
+                    pc = struct.unpack('!H', addr_data[offset:offset+2])[0]
+                    address['pc'] = pc
+                    offset += 2
+                    self.logger.debug(f"{addr_type} Point Code: {pc}")
+            
+            # SSN
+            if ai & SCCP_AI_SSN_PRESENT:
+                if offset < len(addr_data):
+                    ssn = addr_data[offset]
+                    address['ssn'] = ssn
+                    offset += 1
+                    self.logger.debug(f"{addr_type} SSN: {ssn}")
+            
+            # Global Title
+            if ai & SCCP_AI_GT_PRESENT:
+                if offset < len(addr_data):
+                    gt_data = addr_data[offset:]
+                    self.logger.debug(f"{addr_type} GT Data: {gt_data.hex()}")
+                    
+                    # Skip GT indicator bytes (TT, NP, NOA)
+                    if len(gt_data) >= 3:
+                        gt_bcd = gt_data[3:]  # Skip first 3 bytes (TT, NP+Enc, NOA)
+                        gt = self.decode_bcd_digits(gt_bcd)
+                        address['gt'] = gt
+                        self.logger.debug(f"{addr_type} GT: {gt}")
+                        
+        except Exception as e:
+            self.logger.error(f"Error parsing {addr_type} address: {e}")
+            
+        return address
+    
+    def parse_tcap_message(self, tcap_data):
+        """Parse TCAP message with comprehensive logging"""
+        try:
+            self.logger.info(f"Parsing TCAP message: {len(tcap_data)} bytes")
+            self.logger.debug(f"TCAP raw data: {tcap_data.hex()}")
+            
+            if len(tcap_data) < 2:
+                self.logger.error("TCAP data too short")
+                return None, None, None, None
+            
+            tcap_tag = tcap_data[0]
+            tcap_len = tcap_data[1]
+            
+            self.logger.info(f"TCAP Tag: 0x{tcap_tag:02X} ({'BEGIN' if tcap_tag == TCAP_BEGIN else 'OTHER'})")
+            self.logger.info(f"TCAP Length: {tcap_len}")
+            
+            if tcap_tag != TCAP_BEGIN:
+                self.logger.warning(f"Expected TCAP BEGIN (0x62), got 0x{tcap_tag:02X}")
+            
+            # Parse TCAP components
+            transaction_id = None
+            invoke_id = None
+            msisdn = None
+            
+            # Look for transaction ID (dtid)
+            for i in range(len(tcap_data) - 4):
+                # Look for dtid tag (0x49)
+                if tcap_data[i] == 0x49:
+                    tid_len = tcap_data[i + 1]
+                    if tid_len <= 4 and i + 2 + tid_len <= len(tcap_data):
+                        transaction_id = tcap_data[i + 2:i + 2 + tid_len]
+                        self.logger.info(f"Found Transaction ID: {transaction_id.hex()}")
+                        break
+            
+            # Look for invoke ID and operation code
+            for i in range(len(tcap_data) - 10):
+                # Look for invoke ID (INTEGER tag 0x02)
+                if tcap_data[i] == ASN1_INTEGER and tcap_data[i + 1] == 0x01:
+                    invoke_id = tcap_data[i + 2]
+                    self.logger.info(f"Found Invoke ID: {invoke_id}")
+                
+                # Look for MAP SRI-SM operation code
+                if (tcap_data[i] == ASN1_INTEGER and tcap_data[i + 1] == 0x01 and 
+                    tcap_data[i + 2] == MAP_SRI_SM):
+                    self.logger.info(f"Found MAP SRI-SM operation code at offset {i}")
+            
+            # Enhanced MSISDN parsing with multiple patterns
+            msisdn = self.extract_msisdn_from_tcap(tcap_data)
+            
+            return transaction_id, invoke_id, msisdn, tcap_data
+            
+        except Exception as e:
+            self.logger.error(f"Error parsing TCAP message: {e}")
+            return None, None, None, None
+    
+    def extract_msisdn_from_tcap(self, tcap_data):
+        """Extract MSISDN from TCAP data with multiple search patterns"""
+        msisdn = None
+        
+        self.logger.debug("Searching for MSISDN in TCAP data...")
+        
+        # Pattern 1: Look for AddressString after invoke parameters
+        for i in range(len(tcap_data) - 5):
+            # Look for OCTET STRING or context tags containing phone numbers
+            if tcap_data[i] in [0x04, 0x80, 0x81, 0x82]:  # OCTET_STRING or context tags
+                length = tcap_data[i + 1]
+                if 3 <= length <= 15:  # Reasonable length for phone number
+                    if i + 2 + length <= len(tcap_data):
+                        # Check if this looks like a phone number (starts with TON/NPI)
+                        potential_data = tcap_data[i + 2:i + 2 + length]
+                        if len(potential_data) > 0:
+                            # Check for international TON/NPI (0x91)
+                            if potential_data[0] == 0x91:
+                                msisdn_bcd = potential_data[1:]
+                                msisdn = self.decode_bcd_digits(msisdn_bcd)
+                                if msisdn and len(msisdn) >= 8:  # Valid phone number length
+                                    self.logger.info(f"Found MSISDN (Pattern TON/NPI): {msisdn}")
+                                    return msisdn
+                            else:
+                                # Try direct BCD decoding
+                                msisdn = self.decode_bcd_digits(potential_data)
+                                if msisdn and len(msisdn) >= 8:
+                                    self.logger.info(f"Found MSISDN (Pattern BCD): {msisdn}")
+                                    return msisdn
+        
+        # Pattern 2: Search for specific MAP parameter patterns
+        for i in range(len(tcap_data) - 10):
+            # Look for sequence of bytes that might indicate MSISDN parameter
+            if tcap_data[i:i+3] == bytes([0x30, 0x0A, 0x80]):  # Common MAP parameter pattern
+                if i + 5 < len(tcap_data):
+                    length = tcap_data[i + 4]
+                    if 3 <= length <= 12:
+                        msisdn_data = tcap_data[i + 5:i + 5 + length]
+                        msisdn = self.decode_bcd_digits(msisdn_data)
+                        if msisdn and len(msisdn) >= 8:
+                            self.logger.info(f"Found MSISDN (Pattern MAP): {msisdn}")
+                            return msisdn
+        
+        # Fallback: Use configured remote GT
+        if not msisdn:
+            msisdn = CONFIG['remote_gt']
+            self.logger.warning(f"MSISDN not found in TCAP data, using configured remote GT: {msisdn}")
+        
+        return msisdn
+    
     def create_sccp_response(self, calling_addr, called_addr, tcap_data):
-        """Create SCCP UDT response"""
-        # SCCP UDT Header
-        sccp_type = SCCP_UDT
-        protocol_class = 0x00  # Class 0
-        
-        # Create addresses
-        called_sccp = SCCPAddress(gt=calling_addr['gt'], pc=calling_addr['pc'], ssn=calling_addr['ssn'])
-        calling_sccp = SCCPAddress(gt=called_addr['gt'], pc=called_addr['pc'], ssn=called_addr['ssn'])
-        
-        called_addr_data = called_sccp.pack()
-        calling_addr_data = calling_sccp.pack()
-        
-        # Calculate pointer values
-        ptr1 = 3  # Points after the 3 pointer bytes
-        ptr2 = ptr1 + len(called_addr_data)
-        ptr3 = ptr2 + len(calling_addr_data)
-        
-        # Build SCCP UDT
-        sccp_header = struct.pack('!BBBB', sccp_type, protocol_class, ptr1, ptr2)
-        sccp_header += struct.pack('!B', ptr3)
-        sccp_data = sccp_header + called_addr_data + calling_addr_data + tcap_data
-        
-        return sccp_data
+        """Create SCCP UDT response with detailed logging"""
+        try:
+            self.logger.info("Creating SCCP UDT Response:")
+            self.logger.info(f"  Original Calling: GT={calling_addr.get('gt')}, PC={calling_addr.get('pc')}, SSN={calling_addr.get('ssn')}")
+            self.logger.info(f"  Original Called: GT={called_addr.get('gt')}, PC={called_addr.get('pc')}, SSN={called_addr.get('ssn')}")
+            
+            # SCCP UDT Header
+            sccp_type = SCCP_UDT
+            protocol_class = 0x00  # Class 0
+            
+            # Swap addresses for response (called becomes calling, calling becomes called)
+            response_called = SCCPAddress(
+                gt=calling_addr.get('gt'), 
+                pc=calling_addr.get('pc'), 
+                ssn=calling_addr.get('ssn')
+            )
+            response_calling = SCCPAddress(
+                gt=called_addr.get('gt') or CONFIG['hlr_gt'], 
+                pc=called_addr.get('pc') or CONFIG['local_pc'], 
+                ssn=called_addr.get('ssn') or CONFIG['ssn']
+            )
+            
+            self.logger.info(f"  Response Called: GT={response_called.gt}, PC={response_called.pc}, SSN={response_called.ssn}")
+            self.logger.info(f"  Response Calling: GT={response_calling.gt}, PC={response_calling.pc}, SSN={response_calling.ssn}")
+            
+            called_addr_data = response_called.pack()
+            calling_addr_data = response_calling.pack()
+            
+            self.logger.debug(f"  Called Address Data: {called_addr_data.hex()}")
+            self.logger.debug(f"  Calling Address Data: {calling_addr_data.hex()}")
+            
+            # Calculate pointer values (relative to start of pointers)
+            ptr1 = 3  # Points to called address after 3 pointer bytes
+            ptr2 = ptr1 + len(called_addr_data)
+            ptr3 = ptr2 + len(calling_addr_data)
+            
+            self.logger.debug(f"  SCCP Pointers: ptr1={ptr1}, ptr2={ptr2}, ptr3={ptr3}")
+            
+            # Build SCCP UDT
+            sccp_header = struct.pack('!BBBB', sccp_type, protocol_class, ptr1, ptr2)
+            sccp_header += struct.pack('!B', ptr3)
+            sccp_data = sccp_header + called_addr_data + calling_addr_data + tcap_data
+            
+            self.logger.info(f"  Complete SCCP UDT Response: {len(sccp_data)} bytes")
+            self.logger.debug(f"  SCCP Response: {sccp_data.hex()}")
+            
+            return sccp_data
+            
+        except Exception as e:
+            self.logger.error(f"Error creating SCCP response: {e}")
+            return None
     
     def create_m3ua_data_message(self, dest_pc, orig_pc, sccp_data):
-        """Create M3UA DATA message"""
-        # ITU-T MTP3 Header (5 bytes):
-        # Byte 0: (NI << 2) | SI
-        # Byte 1-2: DPC (Destination Point Code, 2 bytes, LSB first)
-        # Byte 3-4: OPC (Originating Point Code, 2 bytes, LSB first)
-        ni = CONFIG['network_indicator']  # Usually 2 for international
-        si = 3  # SCCP
-        # Correct header: first byte, then DPC (LSB first), then OPC (LSB first)
-        mtp3_header = struct.pack('!B', (ni << 2) | si) + struct.pack('<H', dest_pc) + struct.pack('<H', orig_pc)
-        protocol_data = mtp3_header + sccp_data
-
-        # M3UA Parameters
-        params = []
-        rc_param = M3UAParameter(M3UA_PARAM_ROUTING_CONTEXT, struct.pack('!I', CONFIG['route_context']))
-        params.append(rc_param)
-        pd_param = M3UAParameter(M3UA_PARAM_PROTOCOL_DATA, protocol_data)
-        params.append(pd_param)
-
-        param_data = b''.join([p.pack() for p in params])
-        msg_length = 8 + len(param_data)
-        return M3UAMessage(version=1, msg_class=M3UA_TRANSFER_CLASS,
-                          msg_type=M3UA_DATA, length=msg_length,
-                          data=param_data)
+        """Create M3UA DATA message with enhanced logging"""
+        try:
+            self.logger.info("Creating M3UA DATA Message:")
+            self.logger.info(f"  Destination PC: {dest_pc}")
+            self.logger.info(f"  Originating PC: {orig_pc}")
+            self.logger.info(f"  SCCP Data Length: {len(sccp_data)} bytes")
+            
+            # MTP3 Header (5 bytes for ITU-T format):
+            ni = CONFIG['network_indicator']  # Network Indicator
+            si = 3  # Service Indicator (SCCP)
+            sls = 0  # Signaling Link Selection
+            
+            # Encode MTP3 header: SIO + DPC (2 bytes, LSB first) + OPC (2 bytes, LSB first)
+            sio = (ni << 2) | si
+            mtp3_header = struct.pack('!B', sio)  # SIO
+            mtp3_header += struct.pack('<H', dest_pc)  # DPC (Little Endian)
+            mtp3_header += struct.pack('<H', orig_pc)   # OPC (Little Endian)
+            
+            self.logger.debug(f"  MTP3 Header: {mtp3_header.hex()}")
+            self.logger.debug(f"    SIO: 0x{sio:02X} (NI={ni}, SI={si})")
+            self.logger.debug(f"    DPC: {dest_pc} (0x{dest_pc:04X})")
+            self.logger.debug(f"    OPC: {orig_pc} (0x{orig_pc:04X})")
+            
+            protocol_data = mtp3_header + sccp_data
+            
+            # M3UA Parameters
+            params = []
+            
+            # Routing Context
+            rc_param = M3UAParameter(M3UA_PARAM_ROUTING_CONTEXT, 
+                                   struct.pack('!I', CONFIG['route_context']))
+            params.append(rc_param)
+            self.logger.debug(f"  Routing Context: {CONFIG['route_context']}")
+            
+            # Protocol Data
+            pd_param = M3UAParameter(M3UA_PARAM_PROTOCOL_DATA, protocol_data)
+            params.append(pd_param)
+            
+            param_data = b''.join([p.pack() for p in params])
+            msg_length = 8 + len(param_data)
+            
+            m3ua_msg = M3UAMessage(version=1, msg_class=M3UA_TRANSFER_CLASS,
+                                 msg_type=M3UA_DATA, length=msg_length,
+                                 data=param_data)
+            
+            self.logger.info(f"  M3UA DATA Message: {msg_length} bytes total")
+            self.logger.debug(f"  Complete M3UA Message: {m3ua_msg.pack().hex()}")
+            
+            return m3ua_msg
+            
+        except Exception as e:
+            self.logger.error(f"Error creating M3UA DATA message: {e}")
+            return None
     
     def handle_m3ua_data(self, m3ua_msg, conn, addr):
-        """Handle M3UA DATA message containing SCCP/MAP with robust MTP3 header search and enhanced logging"""
+        """Handle M3UA DATA message containing SCCP/MAP with comprehensive parsing"""
         try:
-            self.logger.info(f"Processing M3UA DATA message: {len(m3ua_msg.data)} bytes")
-            self.logger.info(f"M3UA raw data: {m3ua_msg.data.hex()}")
+            self.logger.info("=" * 60)
+            self.logger.info(f"Processing M3UA DATA from {addr[0]}:{addr[1]}")
+            self.logger.info(f"M3UA Message Length: {len(m3ua_msg.data)} bytes")
+            self.logger.debug(f"M3UA raw data: {m3ua_msg.data.hex()}")
 
-            # Parse parameters
+            # Parse M3UA parameters
             offset = 0
             protocol_data = None
             routing_context = None
@@ -516,11 +769,12 @@ class MAPSIGTRANServer:
                     self.logger.warning(f"Failed to unpack parameter at offset {offset}")
                     break
 
-                self.logger.debug(f"Unpacked M3UA param tag: 0x{param.tag:04X}, length: {param.length}, padded_len: {param_len}, offset: {offset}")
+                self.logger.debug(f"M3UA Parameter: tag=0x{param.tag:04X}, length={param.length}")
+                
                 if param.tag == M3UA_PARAM_PROTOCOL_DATA:
                     protocol_data = param.value
                     self.logger.info(f"Found Protocol Data: {len(protocol_data)} bytes")
-                    self.logger.info(f"Protocol Data (hex): {protocol_data.hex()}")
+                    
                 elif param.tag == M3UA_PARAM_ROUTING_CONTEXT:
                     routing_context = struct.unpack('!I', param.value)[0]
                     self.logger.info(f"Found Routing Context: {routing_context}")
@@ -528,79 +782,268 @@ class MAPSIGTRANServer:
                 offset += param_len
 
             if not protocol_data:
-                self.logger.error("No Protocol Data found in M3UA message. Check M3UA parameter parsing!")
+                self.logger.error("No Protocol Data found in M3UA message")
                 return
 
-            # Now protocol_data should start with MTP3 header
-            self.logger.info(f"Protocol Data hex (first 32 bytes): {protocol_data[:32].hex()}")
-            # Print raw Protocol Data bytes
-            self.logger.info(f"Protocol Data (hex): {protocol_data.hex()}")
+            self.logger.debug(f"Protocol Data: {protocol_data.hex()}")
 
-                # SIGTRAN MTP3 header format (if applicable)
-            if protocol_data and len(protocol_data) >= 6:
-                # Find the correct offset for MTP3 header
-                mtp3_offset = 0  # Adjust this if needed based on your TLV structure
+
+            # Find the actual MTP3 header - look for SIO byte pattern
+            mtp3_offset = None
+            for i in range(len(protocol_data) - 5):
+                # Look for SIO pattern: service indicator 3 (SCCP) with network indicator
+                if protocol_data[i] in [0x03, 0x83, 0x0B, 0x8B]:  # Common SCCP SIO values
+                      mtp3_offset = i
+                      break
+
+            if mtp3_offset is None:
+                # Fallback: try fixed offset 8 (common for SIGTRAN)
+                mtp3_offset = 8
+
+            if len(protocol_data) >= mtp3_offset + 5:
                 sio = protocol_data[mtp3_offset]
-                opc = struct.unpack('!H', protocol_data[mtp3_offset+2:mtp3_offset+4])[0]
-                dpc = struct.unpack('!H', protocol_data[mtp3_offset+6:mtp3_offset+8])[0]
-                SI = protocol_data[mtp3_offset+8]
-                NI = protocol_data[mtp3_offset+9]
-                MP = protocol_data[mtp3_offset+10]
-                SLS = protocol_data[mtp3_offset+11]
+                dpc = struct.unpack('<H', protocol_data[mtp3_offset+1:mtp3_offset+3])[0]
+                opc = struct.unpack('<H', protocol_data[mtp3_offset+3:mtp3_offset+5])[0]
 
-                self.logger.info("MTP3 Routing Label (SIGTRAN format):")
-                self.logger.info(f"  SIO: 0x{sio:02X}")
-                self.logger.info(f"  OPC: {opc} (0x{opc:04X})")
+                # SCCP data starts after 9 bytes (4 SIGTRAN + 5 MTP3)
+                sccp_data = protocol_data[9:]
+
+                ni = (sio >> 2) & 0x03
+                si = sio & 0x03
+                
+                self.logger.info(f"MTP3 Header:")
+                self.logger.info(f"  SIO: 0x{sio:02X} (NI={ni}, SI={si})")
                 self.logger.info(f"  DPC: {dpc} (0x{dpc:04X})")
-                self.logger.info(f"  SI: {SI}")    
-                self.logger.info(f"  NI: {NI}")
-                self.logger.info(f"  MP: {MP}")
-                self.logger.info(f"  SLS: {SLS}")
-                self.logger.info(f"  After MTP3 Header (hex): {protocol_data[mtp3_offset:mtp3_offset+9].hex()}")
-
-                # SCCP Message Type (next byte)
-                if len(protocol_data) > 6:
-                    sccp_type = protocol_data[6]
-                    self.logger.info(f"  SCCP Message Type: 0x{sccp_type:02X} ({'UDT' if sccp_type == 0x09 else 'Other'})")
-
-                    # SCCP pointers and fields
-                    if len(protocol_data) > 9:
-                        ptr_called = protocol_data[7]
-                        ptr_calling = protocol_data[8]
-                        ptr_data = protocol_data[9]
-                        self.logger.info(f"  SCCP Pointers: Called={ptr_called}, Calling={ptr_calling}, Data={ptr_data}")
-
-                        # Protocol Class, Hop Counter
-                        if len(protocol_data) > 11:
-                            protocol_class = protocol_data[9]
-                            hop_counter = protocol_data[10]
-                            self.logger.info(f"  SCCP Protocol Class: {protocol_class}")
-                            self.logger.info(f"  SCCP Hop Counter: {hop_counter}")
-
-                        # Called Party Address
-                        called_addr_offset = 11
-                        if len(protocol_data) > called_addr_offset:
-                            called_addr_len = protocol_data[called_addr_offset]
-                            self.logger.info(f"  Called Party Address Length: {called_addr_len}")
-                            if len(protocol_data) > called_addr_offset + 1:
-                                called_ai = protocol_data[called_addr_offset + 1]
-                                self.logger.info(f"  Called Party Address Indicator: 0x{called_ai:02X}")
-
-                        # You can add more parsing for Calling Party, User Data, etc. here
+                self.logger.info(f"  OPC: {opc} (0x{opc:04X})")
+                
+                # SCCP data starts after MTP3 header
+                sccp_data = protocol_data[mtp3_offset + 5:]
+                self.logger.info(f"SCCP Data: {len(sccp_data)} bytes")
+                self.logger.debug(f"SCCP Data: {sccp_data.hex()}")
+                
+                if len(sccp_data) > 0:
+                    sccp_type = sccp_data[0]
+                    self.logger.info(f"SCCP Message Type: 0x{sccp_type:02X} ({'UDT' if sccp_type == 0x09 else 'XUDT' if sccp_type == 0x11 else 'Other'})") 
+                    
+                    if sccp_type == SCCP_UDT or sccp_type == SCCP_XUDT:
+                        self.handle_sccp_udt(sccp_data, opc, dpc, conn, addr)
+                    else:
+                        self.logger.warning(f"Unsupported SCCP message type: 0x{sccp_type:02X}")
+            else:
+                self.logger.error("Protocol data too short for MTP3 header")
 
         except Exception as e:
             self.logger.error(f"Error in handle_m3ua_data: {e}")
-        # Optionally add a finally block if you need cleanup
+        finally:
+            self.logger.info("=" * 60)
     
+    def handle_sccp_udt(self, sccp_data, orig_pc, dest_pc, conn, addr):
+        """Handle SCCP UDT message"""
+        try:
+            self.logger.info("Processing SCCP UDT Message:")
+            
+            if len(sccp_data) < 5:
+                self.logger.error("SCCP UDT data too short")
+                return
+            
+            protocol_class = sccp_data[1]
+            self.logger.info(f"  Protocol Class: {protocol_class}")
+            
+            # Parse SCCP addresses and get TCAP data
+            addresses, tcap_offset = self.parse_sccp_addresses(sccp_data, 2)
+            
+            if tcap_offset < len(sccp_data):
+                tcap_data = sccp_data[tcap_offset:]
+                self.logger.info(f"  TCAP Data: {len(tcap_data)} bytes")
+                self.logger.debug(f"  TCAP Data: {tcap_data.hex()}")
+                
+                # Parse TCAP message
+                transaction_id, invoke_id, msisdn, _ = self.parse_tcap_message(tcap_data)
+                
+                if invoke_id is not None and msisdn:
+                    # Create SRI-SM response
+                    response_tcap = self.create_sri_sm_response(invoke_id, msisdn, transaction_id)
+                    
+                    # Create SCCP response
+                    sccp_response = self.create_sccp_response(
+                        addresses['calling'], 
+                        addresses['called'], 
+                        response_tcap
+                    )
+                    
+                    if sccp_response:
+                        # Create M3UA DATA response
+                        m3ua_response = self.create_m3ua_data_message(
+                            orig_pc,  # Send back to originator
+                            dest_pc,  # From destination
+                            sccp_response
+                        )
+                        
+                        if m3ua_response:
+                            response_data = m3ua_response.pack()
+                            conn.send(response_data)
+                            self.logger.info(f"Sent SRI-SM Response: {len(response_data)} bytes")
+                            self.logger.info(f"  MSISDN: {msisdn}")
+                            self.logger.info(f"  NNN: {CONFIG['msc_gt']}")
+                            self.logger.info(f"  IMSI: {self.generate_imsi(msisdn)}")
+                        else:
+                            self.logger.error("Failed to create M3UA response")
+                    else:
+                        self.logger.error("Failed to create SCCP response")
+                else:
+                    self.logger.warning("Could not extract invoke_id or MSISDN from TCAP message")
+            else:
+                self.logger.error("No TCAP data found in SCCP UDT")
+                
+        except Exception as e:
+            self.logger.error(f"Error handling SCCP UDT: {e}")
+    
+    def handle_m3ua_data(self, m3ua_msg, conn, addr):
+      """Handle M3UA DATA message containing SCCP/MAP with comprehensive parsing"""
+      try:
+        self.logger.info("=" * 60)
+        self.logger.info(f"Processing M3UA DATA from {addr[0]}:{addr[1]}")
+        self.logger.info(f"M3UA Message Length: {len(m3ua_msg.data)} bytes")
+        self.logger.debug(f"M3UA raw data: {m3ua_msg.data.hex()}")
+
+        # Parse M3UA parameters
+        offset = 0
+        protocol_data = None
+        routing_context = None
+
+        while offset < len(m3ua_msg.data):
+            param, param_len = M3UAParameter.unpack(m3ua_msg.data[offset:])
+            if not param or param_len == 0:
+                self.logger.warning(f"Failed to unpack parameter at offset {offset}")
+                break
+
+            # Detailed parameter logging
+            self.logger.info(f"M3UA Parameter Details:")
+            self.logger.info(f"  Tag: {param.tag} (0x{param.tag:04X})")
+            self.logger.info(f"  Length: {param.length} (0x{param.length:04X})")
+            self.logger.info(f"  Value Length: {len(param.value)} bytes")
+            self.logger.info(f"  Padded Length: {param_len} bytes")
+            
+            if len(param.value) <= 32:  # Show hex for small values
+                self.logger.info(f"  Value (hex): {param.value.hex()}")
+            else:
+                self.logger.info(f"  Value (hex, first 32 bytes): {param.value[:32].hex()}...")
+            
+            if param.tag == M3UA_PARAM_PROTOCOL_DATA:
+                protocol_data = param.value
+                self.logger.info(f"  -> This is Protocol Data parameter")
+                
+            elif param.tag == M3UA_PARAM_ROUTING_CONTEXT:
+                routing_context = struct.unpack('!I', param.value)[0]
+                self.logger.info(f"  -> This is Routing Context: {routing_context}")
+            
+            elif param.tag == M3UA_PARAM_NETWORK_APPEARANCE:
+                na_value = struct.unpack('!I', param.value)[0] if len(param.value) >= 4 else 0
+                self.logger.info(f"  -> This is Network Appearance: {na_value}")
+            
+            else:
+                self.logger.info(f"  -> Unknown/Other parameter type")
+
+            offset += param_len
+
+        if not protocol_data:
+            self.logger.error("No Protocol Data found in M3UA message")
+            return
+
+        self.logger.info(f"Protocol Data: {protocol_data.hex()}")
+
+        # Find the actual MTP3 header - look for SIO byte pattern
+        mtp3_offset = None
+        self.logger.info("Searching for MTP3 header in Protocol Data...")
+        
+        for i in range(len(protocol_data) - 5):
+            # Look for SIO pattern: service indicator 3 (SCCP) with network indicator
+            sio_candidate = protocol_data[i]
+            si = sio_candidate & 0x0F  # Service Indicator (lower 4 bits)
+            ni = (sio_candidate >> 4) & 0x03  # Network Indicator (bits 4-5)
+            
+            self.logger.debug(f"  Offset {i}: byte=0x{sio_candidate:02X}, SI={si}, NI={ni}")
+            
+            if si == 3:  # SCCP Service Indicator
+                mtp3_offset = i
+                self.logger.info(f"  Found potential MTP3 header at offset {i}")
+                break
+
+        if mtp3_offset is None:
+            # Fallback: try common fixed offsets
+            for fallback_offset in [8, 12, 16]:
+                if fallback_offset < len(protocol_data):
+                    sio_candidate = protocol_data[fallback_offset]
+                    si = sio_candidate & 0x0F
+                    if si == 3:
+                        mtp3_offset = fallback_offset
+                        self.logger.info(f"  Using fallback MTP3 offset: {fallback_offset}")
+                        break
+        
+        if mtp3_offset is None:
+            self.logger.error("Could not find MTP3 header in Protocol Data")
+            return
+
+        # Parse MTP3 header
+        if len(protocol_data) >= mtp3_offset + 5:
+            sio = protocol_data[mtp3_offset]
+            dpc = struct.unpack('<H', protocol_data[mtp3_offset+1:mtp3_offset+3])[0]  # Little Endian
+            opc = struct.unpack('<H', protocol_data[mtp3_offset+3:mtp3_offset+5])[0]  # Little Endian
+            
+            ni = (sio >> 4) & 0x03
+            si = sio & 0x0F
+            
+            self.logger.info(f"MTP3 Header (at offset {mtp3_offset}):")
+            self.logger.info(f"  SIO: 0x{sio:02X} (NI={ni}, SI={si})")
+            self.logger.info(f"  DPC: {dpc} (0x{dpc:04X})")
+            self.logger.info(f"  OPC: {opc} (0x{opc:04X})")
+            
+            # Extract SCCP data (after MTP3 header)
+            sccp_data = protocol_data[mtp3_offset + 5:]
+            self.logger.info(f"SCCP Data: {len(sccp_data)} bytes")
+            self.logger.debug(f"SCCP Data: {sccp_data.hex()}")
+            
+            if len(sccp_data) > 0:
+                sccp_type = sccp_data[0]
+                self.logger.info(f"SCCP Message Type: 0x{sccp_type:02X}")
+                
+                # Map SCCP message types to names
+                sccp_type_names = {
+                    0x09: 'UDT (Unitdata)',
+                    0x0A: 'UDTS (Unitdata Service)',
+                    0x11: 'XUDT (Extended Unitdata)',
+                    0x12: 'XUDTS (Extended Unitdata Service)'
+                }
+                
+                type_name = sccp_type_names.get(sccp_type, f'Unknown (0x{sccp_type:02X})')
+                self.logger.info(f"SCCP Message Type Name: {type_name}")
+                
+                if sccp_type == SCCP_UDT or sccp_type == 0x11:  # UDT or XUDT
+                    self.handle_sccp_udt(sccp_data, opc, dpc, conn, addr)
+                else:
+                    self.logger.warning(f"Unsupported SCCP message type: 0x{sccp_type:02X} ({type_name})")
+        else:
+            self.logger.error("Protocol data too short for MTP3 header at calculated offset")
+
+      except Exception as e:
+        self.logger.error(f"Error in handle_m3ua_data: {e}")
+        import traceback
+        self.logger.error(f"Traceback: {traceback.format_exc()}")
+      finally:
+        self.logger.info("=" * 60)
+    
+
+        # Optionally add a finally block if you need cleanup
+
     def handle_m3ua_message(self, message, conn, addr):
         """Handle M3UA protocol messages"""
         conn_key = f"{addr[0]}:{addr[1]}"
-        
+
         if conn_key not in self.asp_states:
             self.asp_states[conn_key] = {'state': 'ASP-DOWN'}
-        
+
         asp_state = self.asp_states[conn_key]
-        
+
         if message.msg_class == M3UA_ASPSM_CLASS:
             if message.msg_type == M3UA_ASPUP:
                 self.logger.info(f"M3UA ASPUP received from {addr[0]}:{addr[1]}")
@@ -609,14 +1052,14 @@ class MAPSIGTRANServer:
                     conn.send(response.pack())
                     asp_state['state'] = 'ASP-INACTIVE'
                     self.logger.info(f"M3UA ASPUP-ACK sent to {addr[0]}:{addr[1]}")
-            
+
             elif message.msg_type == M3UA_BEAT:
                 self.logger.info(f"M3UA HEARTBEAT received from {addr[0]}:{addr[1]}")
                 response = self.create_m3ua_response(M3UA_ASPSM_CLASS, M3UA_BEAT)
                 if response:
                     conn.send(response.pack())
                     self.logger.info(f"M3UA HEARTBEAT-ACK sent to {addr[0]}:{addr[1]}")
-        
+
         elif message.msg_class == M3UA_ASPTM_CLASS:
             if message.msg_type == M3UA_ASPAC:
                 self.logger.info(f"M3UA ASPAC received from {addr[0]}:{addr[1]}")
@@ -625,13 +1068,13 @@ class MAPSIGTRANServer:
                     conn.send(response.pack())
                     asp_state['state'] = 'ASP-ACTIVE'
                     self.logger.info(f"M3UA ASPAC-ACK sent to {addr[0]}:{addr[1]}")
-        
+
         elif message.msg_class == M3UA_TRANSFER_CLASS:
             if message.msg_type == M3UA_DATA:
                 self.handle_m3ua_data(message, conn, addr)
-    
+
     def handle_client(self, conn, addr):
-        """Handle client connection"""
+        """Handle client connection with enhanced error handling"""
         try:
             self.logger.info(f"SCTP association established with {addr[0]}:{addr[1]}")
             
@@ -639,33 +1082,45 @@ class MAPSIGTRANServer:
                 try:
                     data = conn.recv(4096)
                     if not data:
+                        self.logger.info(f"Client {addr[0]}:{addr[1]} disconnected")
                         break
                     
-                    self.logger.info(f"SCTP DATA received from {addr[0]}:{addr[1]} - {len(data)} bytes")
+                    self.logger.debug(f"Raw SCTP DATA from {addr[0]}:{addr[1]} - {len(data)} bytes: {data.hex()}")
                     
                     # Parse M3UA message
                     m3ua_msg = M3UAMessage.unpack(data)
                     if m3ua_msg and m3ua_msg.version == 1:
-                        self.logger.info(f"M3UA Message - Class: {m3ua_msg.msg_class}, Type: {m3ua_msg.msg_type}")
                         self.handle_m3ua_message(m3ua_msg, conn, addr)
+                    else:
+                        self.logger.warning(f"Invalid M3UA message from {addr[0]}:{addr[1]}")
+                        if m3ua_msg:
+                            self.logger.warning(f"  Version: {m3ua_msg.version}, expected: 1")
                     
                 except socket.timeout:
                     continue
                 except socket.error as e:
-                    self.logger.warning(f"Client {addr[0]}:{addr[1]} error: {e}")
+                    self.logger.warning(f"Socket error from {addr[0]}:{addr[1]}: {e}")
+                    break
+                except Exception as e:
+                    self.logger.error(f"Unexpected error handling data from {addr[0]}:{addr[1]}: {e}")
                     break
         
         except Exception as e:
-            self.logger.error(f"Error handling client {addr[0]}:{addr[1]}: {e}")
+            self.logger.error(f"Error in client handler for {addr[0]}:{addr[1]}: {e}")
         finally:
             conn_key = f"{addr[0]}:{addr[1]}"
             if conn_key in self.asp_states:
                 del self.asp_states[conn_key]
-            conn.close()
+                self.logger.info(f"Removed ASP state for {conn_key}")
+            
+            try:
+                conn.close()
+            except:
+                pass
             self.logger.info(f"Connection closed with {addr[0]}:{addr[1]}")
     
     def start(self):
-        """Start the MAP SIGTRAN server"""
+        """Start the enhanced MAP SIGTRAN server"""
         try:
             if not self.check_sctp_support():
                 return
@@ -677,14 +1132,21 @@ class MAPSIGTRANServer:
             self.socket.bind((self.host, self.port))
             self.socket.listen(5)
             
-            self.logger.info(f"MAP SIGTRAN Server (SCTP) listening on {self.host}:{self.port}")
-            self.logger.info("Ready to handle MAP SRI-SM requests")
+            self.logger.info("=" * 60)
+            self.logger.info(f"Enhanced MAP SIGTRAN Server listening on {self.host}:{self.port}")
+            self.logger.info("Features:")
+            self.logger.info("  - MAP SRI-SM request handling")
+            self.logger.info("  - SRI-SM response with NNN and IMSI")
+            self.logger.info("  - Comprehensive protocol logging")
+            self.logger.info("  - M3UA/SCCP/TCAP/MAP stack support")
+            self.logger.info("=" * 60)
             
             self.running = True
             
             while self.running:
                 try:
                     conn, addr = self.socket.accept()
+                    self.logger.info(f"New SCTP connection from {addr[0]}:{addr[1]}")
                     
                     client_thread = threading.Thread(
                         target=self.handle_client,
@@ -693,6 +1155,8 @@ class MAPSIGTRANServer:
                     client_thread.daemon = True
                     client_thread.start()
                 
+                except socket.timeout:
+                    continue  # Just continue waiting for connections
                 except socket.error as e:
                     if self.running:
                         self.logger.error(f"Accept error: {e}")
@@ -705,40 +1169,66 @@ class MAPSIGTRANServer:
     
     def stop(self):
         """Stop the server"""
-        self.logger.info("Stopping MAP SIGTRAN server...")
+        self.logger.info("Stopping Enhanced MAP SIGTRAN server...")
         self.running = False
         if self.socket:
-            self.socket.close()
+            try:
+                self.socket.close()
+            except:
+                pass
     
     def cleanup(self):
         """Clean up resources"""
         if self.socket:
-            self.socket.close()
-        self.logger.info("MAP SIGTRAN server stopped")
+            try:
+                self.socket.close()
+            except:
+                pass
+        self.logger.info("Enhanced MAP SIGTRAN server stopped")
 
 def main():
-    """Main function"""
-    print("MAP SIGTRAN Server with SRI-SM Support")
+    """Main function with enhanced startup information"""
+    print("=" * 60)
+    print("Enhanced MAP SIGTRAN Server with SRI-SM Support")
     print("Handles Send Routing Info for Short Message requests")
+    print("Responds with Network Node Number (NNN) and IMSI")
+    print("=" * 60)
     print()
     
     server = MAPSIGTRANServer()
     
     try:
-        print("Starting MAP SIGTRAN Server on port 2915...")
+        print("Starting Enhanced MAP SIGTRAN Server...")
         print("Configuration:")
-        print(f"  Local GT: {CONFIG['local_gt']}, PC: {CONFIG['local_pc']}")
-        print(f"  Remote GT: {CONFIG['remote_gt']}, PC: {CONFIG['remote_pc']}")
+        print(f"  Local GT (HLR): {CONFIG['local_gt']}")
+        print(f"  Local PC: {CONFIG['local_pc']}")
+        print(f"  Remote GT: {CONFIG['remote_gt']}")
+        print(f"  Remote PC: {CONFIG['remote_pc']}")
         print(f"  Route Context: {CONFIG['route_context']}")
-        print("Press Ctrl+C to stop")
+        print(f"  MSC GT (NNN): {CONFIG['msc_gt']}")
+        print(f"  VLR GT: {CONFIG['vlr_gt']}")
         print()
+        print("Features:")
+        print("  ✓ Enhanced MSISDN parsing from TCAP")
+        print("  ✓ Proper ASN.1 encoding for MAP responses")
+        print("  ✓ IMSI generation based on MSISDN")
+        print("  ✓ Comprehensive logging to file and console")
+        print("  ✓ Error handling and troubleshooting support")
+        print()
+        print("Logs are written to: map_sigtran_server.log")
+        print("Press Ctrl+C to stop")
+        print("=" * 60)
+        print()
+        
         server.start()
+        
     except KeyboardInterrupt:
         print("\nShutdown requested...")
         server.stop()
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Fatal error: {e}")
         server.stop()
 
 if __name__ == "__main__":
     main()
+    
