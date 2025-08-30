@@ -25,8 +25,8 @@ SCCP_XUDT = 0x11       # Extended Unitdata
 CONFIG = {
     'local_gt': '817085811990',
     'local_pc': 641,
-    'remote_gt': '817090514123', 
-    'remote_pc': 2990,
+    'remote_gt': '817090514560', 
+    'remote_pc': 2120,
     'route_context': 34,
     'ssn': 6,  # HLR SSN
     'network_indicator': 3,  # International network
@@ -428,55 +428,529 @@ class MAPSIGTRANServer:
         return dialogue_portion
 
 
-    def create_mt_fsm_response(self, invoke_id: int, op_code: int, orig_transaction_id: bytes):
+    def extract_dtid_from_tcap(self, tcap_data: bytes) -> bytes:
+        """Extract DTID from incoming TCAP message"""
+        try:
+            def _read_tlv(buf, off):
+                if off >= len(buf):
+                    return None
+                tag = buf[off]
+                off += 1
+                
+                if off >= len(buf):
+                    return None
+                first = buf[off]
+                off += 1
+                
+                if first & 0x80:
+                    n = first & 0x7F
+                    if n == 0 or off + n > len(buf):
+                        return None
+                    length = int.from_bytes(buf[off:off + n], 'big')
+                    off += n
+                else:
+                    length = first
+                
+                val_end = off + length
+                if val_end > len(buf):
+                    return None
+                    
+                return tag, length, off, val_end, val_end
+            
+            # Parse top-level TCAP
+            top = _read_tlv(tcap_data, 0)
+            if not top:
+                return None
+                
+            tcap_tag, tcap_len, tcap_vs, tcap_ve, _ = top
+            
+            # Look for DTID (0x49) in TCAP content
+            off = tcap_vs
+            while off < tcap_ve:
+                tlv = _read_tlv(tcap_data, off)
+                if not tlv:
+                    break
+                tag, length, vs, ve, off = tlv
+                
+                if tag == 0x49:  # DTID
+                    return tcap_data[vs:ve]
+            
+            return None
+            
+        except Exception as e:
+            self.log_error(f"Error extracting DTID from TCAP: {e}")
+            return None
+
+
+    def extract_otid_from_tcap(self, tcap_data: bytes) -> bytes:
+      """Extract OTID (0x48) from incoming TCAP message"""
+      try:
+        def _read_tlv(buf, off):
+            if off >= len(buf): return None
+            tag = buf[off]; off += 1
+            if off >= len(buf): return None
+            first = buf[off]; off += 1
+            if first & 0x80:
+                n = first & 0x7F
+                if n == 0 or off + n > len(buf): return None
+                length = int.from_bytes(buf[off:off + n], 'big')
+                off += n
+            else:
+                length = first
+            val_end = off + length
+            if val_end > len(buf): return None
+            return tag, length, off, val_end, val_end
+
+        # Parse top-level TCAP container
+        top = _read_tlv(tcap_data, 0)
+        if not top: return None
+        _, _, tcap_vs, tcap_ve, _ = top
+
+        # Scan children for OTID (0x48)
+        off = tcap_vs
+        while off < tcap_ve:
+            tlv = _read_tlv(tcap_data, off)
+            if not tlv: break
+            tag, _, vs, ve, off = tlv
+            if tag == 0x48:   # OTID
+                return tcap_data[vs:ve]
+        return None
+      except Exception as e:
+        self.log_error(f"Error extracting OTID from TCAP: {e}")
+        return None
+        
+    def create_mt_fsm_response(self, invoke_id: int, op_code: int, orig_transaction_id: bytes, tcap_data: bytes):
       """
-      Build TCAP END + ReturnResultLast for (MT|MO)-ForwardSM.
+      Build TCAP response for (MT|MO)-ForwardSM based on incoming TCAP message type.
+      - For TCAP BEGIN: responds with TCAP CONTINUE
+      - For TCAP CONTINUE: responds with TCAP CONTINUE (unless final segment detected)
       - invoke_id: from the incoming component
-      - op_code:   echo the incoming op (44=MT-FSM v3, 46=MO-FSM or v1/v2 ForwardSM)
-      - orig_transaction_id: caller's OTID from BEGIN; becomes our DTID in END
+      - op_code: echo the incoming op (44=MT-FSM v3, 46=MO-FSM or v1/v2 ForwardSM)
+      - orig_transaction_id: caller's OTID from BEGIN; becomes our DTID
+      - tcap_data: full TCAP message to analyze for response type
       """
       try:
         self.log_debug("=" * 50)
         self.log_debug("Creating MT-FSM Response:")
 
+        # Determine incoming TCAP message type
+        if len(tcap_data) == 0:
+            self.log_error("Empty TCAP data")
+            return None
+            
+        incoming_tcap_tag = tcap_data[0]
+        tcap_type = {0x62: 'BEGIN', 0x64: 'END', 0x65: 'CONTINUE', 0x67: 'ABORT'}.get(incoming_tcap_tag, 'Unknown')
+        
+        self.log_debug(f"  Incoming TCAP type: {tcap_type} (0x{incoming_tcap_tag:02X})")
+        
+        # Detect if this is the final segment
+        is_final_segment = self.detect_final_segment(tcap_data, invoke_id)
+        self.log_info(f"MT-FSM decision: incoming={tcap_type} final={is_final_segment} "
+                      f"-> send TCAP {'END' if is_final_segment else 'CONTINUE'}")
+        
+        # Decide response TCAP type
+        response_tcap_tag = 0x64
+        if incoming_tcap_tag == 0x62:  # TCAP BEGIN
+            response_tcap_tag = 0x64  # TCAP END
+            self.log_debug("  Response: TCAP END (single segment or first segment complete)")
+        elif incoming_tcap_tag == 0x65:  # TCAP CONTINUE  
+            if is_final_segment:
+                response_tcap_tag = 0x64  # TCAP END
+                self.log_debug("  Response: TCAP END (final segment)")
+            else:
+                response_tcap_tag = 0x65  # TCAP CONTINUE
+                self.log_debug("  Response: TCAP CONTINUE (middle segment)")
+        else:
+            # Default to END for other cases
+            response_tcap_tag = 0x64
+            self.log_debug(f"  Response: TCAP END (default for {tcap_type})")
+
         # --- ReturnResultLast content ---------------------------------------
         # invokeID (INTEGER)
         invoke_id_enc = self.encode_asn1_tag_length(0x02, bytes([invoke_id & 0xFF]))
 
-       
+        # result ::= SEQUENCE { opCode, parameter OPTIONAL }
+        op_code_enc = self.encode_asn1_tag_length(0x02, bytes([op_code & 0xFF]))  # opCode (localValue)
+        # SM-RP-UI (OCTET STRING, optional, empty for success)
+        sm_rp_ui = self.encode_asn1_tag_length(0x04, b"\x00\x00")
+        sm_rp_ui_pack = self.encode_asn1_tag_length(0x30, sm_rp_ui)
+        result_seq = self.encode_asn1_tag_length(0x30, op_code_enc + sm_rp_ui_pack)
+            
+        #rrl_content = invoke_id_enc + result_seq
         rrl_content = invoke_id_enc 
         component = self.encode_asn1_tag_length(0xA2, rrl_content)       # [2] returnResultLast
         component_portion = self.encode_asn1_tag_length(0x6C, component)  # Component Portion
 
+
         # --- Transaction IDs -------------------------------------------------
-        if orig_transaction_id and 1 <= len(orig_transaction_id) <= 4:
-            dtid_value = orig_transaction_id
-        else:
-            import random, struct
-            dtid_value = struct.pack('!I', random.randint(0x10000000, 0xFFFFFFFF))
-        dtid = self.encode_asn1_tag_length(0x49, dtid_value)              # DTID for END
+      
+        if response_tcap_tag == 0x65:  # TCAP CONTINUE
+            # For CONTINUE: need both OTID and DTID
+            # Extract DTID from incoming message (if CONTINUE) to use as our OTID
+            incoming_dtid = self.extract_dtid_from_tcap(tcap_data)
+            incoming_otid = self.extract_otid_from_tcap(tcap_data)
+            
+            if incoming_tcap_tag == 0x65 and incoming_dtid and incoming_otid:
+                # Swap: incoming DTID becomes our OTID, incoming OTID becomes our DTID  
+                otid_value = incoming_dtid
+                dtid_value = incoming_otid
+                self.log_debug(f" CONTINUE->CONTINUE: Swap OK OTID={otid_value.hex()} DTID={dtid_value.hex()}")
+            else:  # Incoming BEGIN
+                # Generate new OTID, use incoming OTID as DTID
+                otid_value = struct.pack('!I', random.randint(0x10000000, 0xFFFFFFFF))
+                dtid_value = orig_transaction_id if orig_transaction_id else struct.pack('!I', random.randint(0x10000000, 0xFFFFFFFF))
+                self.log_debug(f"  BEGIN->CONTINUE: New OTID={otid_value.hex()} DTID={dtid_value.hex()}")
+            
+            otid = self.encode_asn1_tag_length(0x48, otid_value)  # OTID
+            dtid = self.encode_asn1_tag_length(0x49, dtid_value)  # DTID
+            transaction_ids = otid + dtid
+            
+        else:  # TCAP END
+        
+        # --- END branch (fixed) ---
+            # For END: only DTID is present and it must equal the peer's OTID.
+            peer_otid = self.extract_otid_from_tcap(tcap_data)  # present if incoming is CONTINUE
+            if peer_otid and 1 <= len(peer_otid) <= 4:
+                dtid_value = peer_otid
+            elif orig_transaction_id and 1 <= len(orig_transaction_id) <= 4:
+                dtid_value = orig_transaction_id  # fallback to OTID from initial BEGIN
+            else:
+                self.log_error("Cannot determine DTID for TCAP END (no peer OTID available).")
+                return None
+
+            dtid = self.encode_asn1_tag_length(0x49, dtid_value)
+            transaction_ids = dtid
+
 
         # --- Dialogue Portion: AARE with MT-Relay ACN -----------------------
-        # shortMsgMT-RelayContext-v3 OID = 0.4.0.0.1.0.25.3
-        dialogue_portion = self._build_tcap_dialogue_portion_aare("0.4.0.0.1.0.25.3")  # ACN for MT-FSM v3
-        # (If you’re handling legacy ForwardSM without ACN, AARE is still fine.)
-
-        # --- TCAP END --------------------------------------------------------
-        tcap_end_data = dtid + dialogue_portion + component_portion
-        tcap_end = self.encode_asn1_tag_length(0x64, tcap_end_data)       # TC-END
+        # --- Build TCAP Message -----------------------------------------------
+        # Dialogue Portion: not to incoming tcap continue
+        if incoming_tcap_tag == 0x65:
+           tcap_data_content = transaction_ids + component_portion
+        else:
+          dialogue_portion = self._build_tcap_dialogue_portion_aare("0.4.0.0.1.0.25.3") #  MT-FSM v3
+          tcap_data_content = transaction_ids + dialogue_portion + component_portion
+        
+        tcap_response = self.encode_asn1_tag_length(response_tcap_tag, tcap_data_content)
 
         # Logs
-        self.log_debug(f"  TCAP End message created: {len(tcap_end)} bytes")
-        self.log_debug(f"  Complete TCAP End: {tcap_end.hex()}")
+        response_type = {0x64: 'END', 0x65: 'CONTINUE'}.get(response_tcap_tag, 'Unknown')
+        self.log_debug(f"  TCAP {response_type} message created: {len(tcap_response)} bytes")
+        self.log_debug(f"  Complete TCAP {response_type}: {tcap_response.hex()}")
         self.log_debug("=" * 50)
-        return tcap_end
+        return tcap_response
 
       except Exception as e:
         self.log_error(f"Error creating MT-FSM Response: {e}")
         return None
         
- 
+  
+  
+    def detect_final_segment(self, tcap_data: bytes, invoke_id: int) -> bool:
+        """
+        Detect if this is the final segment of a multi-part MT-FSM message.
+        Analyzes TCAP components and MAP parameters to determine segmentation status.
+        """
+        try:
+            self.log_debug("Analyzing MT-FSM segmentation...")
+            is_final = True  # Default assumption
 
+            def _read_tlv(buf, off):
+                if off >= len(buf): return None
+                tag = buf[off]; off += 1
+                if off >= len(buf): return None
+                first = buf[off]; off += 1
+                if first & 0x80:
+                    n = first & 0x7F
+                    if n == 0 or off + n > len(buf): return None
+                    length = int.from_bytes(buf[off:off + n], 'big')
+                    off += n
+                else:
+                    length = first
+                val_end = off + length
+                if val_end > len(buf): return None
+                return tag, length, off, val_end, val_end
+
+            # Parse top-level TCAP container
+            tcap_tlv = _read_tlv(tcap_data, 0)
+            if not tcap_tlv:
+                self.log_info("MT-FSM detect: no top-level TCAP TLV -> assume FINAL")
+                return is_final
+            _, _, tcap_vs, tcap_ve, _ = tcap_tlv
+
+            # Locate Component Portion (tag 0x6C)
+            off = tcap_vs
+            component_portion_data = None
+            while off < tcap_ve:
+                tlv = _read_tlv(tcap_data, off)
+                if not tlv: break
+                tag, length, vs, ve, off = tlv
+                if tag == 0x6C:
+                    component_portion_data = tcap_data[vs:ve]
+                    break
+
+            if not component_portion_data:
+                self.log_info("MT-FSM detect: no Component Portion -> assume FINAL")
+                return is_final
+
+            # Walk components, find Invoke (0xA1) with matching invoke_id
+            comp_off = 0
+            found_param_len = None
+            while comp_off < len(component_portion_data):
+                comp_tlv = _read_tlv(component_portion_data, comp_off)
+                if not comp_tlv: break
+                comp_tag, comp_len, comp_vs, comp_ve, comp_off = comp_tlv
+
+                if comp_tag == 0xA1:  # Invoke
+                    invoke_data = component_portion_data[comp_vs:comp_ve]
+                    inv_off = 0
+                    id_tlv = _read_tlv(invoke_data, inv_off)
+                    if id_tlv and id_tlv[0] == 0x02:
+                        _, _, id_vs, id_ve, inv_off = id_tlv
+                        parsed_invoke_id = int.from_bytes(invoke_data[id_vs:id_ve], "big")
+                        if parsed_invoke_id == invoke_id:
+                            # Scan remaining TLVs inside Invoke to find the operation parameters
+                            while inv_off < len(invoke_data):
+                                param_tlv = _read_tlv(invoke_data, inv_off)
+                                if not param_tlv: break
+                                param_tag, param_len, param_vs, param_ve, inv_off = param_tlv
+                                if param_tag in (0x30, 0xA0):  # tolerate SEQUENCE or EXPLICIT wrapper
+                                    found_param_len = param_ve - param_vs
+                                    mt_fsm_param = invoke_data[param_vs:param_ve]
+                                    is_final = self.analyze_mt_fsm_parameters(mt_fsm_param)
+                                    break
+                            break
+
+            # Always-on summary at INFO level
+            self.log_info("MT-FSM detect summary: invoke_id=%s param_len=%s final=%s"
+                          % (str(invoke_id),
+                             str(found_param_len) if found_param_len is not None else "n/a",
+                             "Yes" if is_final else "No"))
+            return is_final
+
+        except Exception as e:
+            self.log_error(f"Error in final segment detection: {e}")
+            self.log_info("MT-FSM detect summary: error path -> final=Yes")
+            return True
+
+
+
+    def analyze_mt_fsm_parameters(self, mt_fsm_param: bytes) -> bool:
+        """
+        Determine if this MT-FSM segment is the final one using ONLY TP-User-Data (UDH)
+        concatenation IE (0x00 for 8-bit ref, 0x08 for 16-bit ref).
+
+        Decision:
+          - If UDH concat IE present: FINAL  <=> current_part == total_parts
+          - If UDHI=0 or no concat IE: treat as FINAL (single segment assumption)
+          - TP‑MMS is ignored.
+
+        Logs (INFO):
+          - RP-DATA detected? RP-User length? TPDU length?
+          - FO/MTI/UDHI and short hex peeks
+          - UDH concat numbers: "parts=<total_parts> part=<current_part>" (when present)
+          - Final decision
+        """
+        try:
+            def _read_tlv(buf, off):
+                if off >= len(buf): return None
+                tag = buf[off]; off += 1
+                if off >= len(buf): return None
+                first = buf[off]; off += 1
+                if first & 0x80:
+                    n = first & 0x7F
+                    if n == 0 or off + n > len(buf): return None
+                    length = int.from_bytes(buf[off:off+n], 'big'); off += n
+                else:
+                    length = first
+                end = off + length
+                if end > len(buf): return None
+                return tag, length, off, end, end  # tag, len, val_start, val_end, next_off
+
+            # --- 1) Locate sm-RP-UI (MAP ForwardSM-Arg [2]) ---
+            sm_rp_ui = None
+            off = 0
+            while off < len(mt_fsm_param):
+                tlv = _read_tlv(mt_fsm_param, off)
+                if not tlv: break
+                tag, _, vs, ve, off = tlv
+                if tag == 0x82:  # [2] IMPLICIT OCTET STRING
+                    sm_rp_ui = mt_fsm_param[vs:ve]
+                    break
+                elif tag == 0xA2:  # [2] EXPLICIT -> should contain 0x04 inside
+                    inner = _read_tlv(mt_fsm_param, vs)
+                    if inner and inner[0] == 0x04:
+                        _, _, ivs, ive, _ = inner
+                        sm_rp_ui = mt_fsm_param[ivs:ive]
+                        break
+                    sm_rp_ui = mt_fsm_param[vs:ve]
+                    break
+
+            if not sm_rp_ui:
+                # Fallback: first reasonable OCTET STRING payload
+                off = 0
+                while off < len(mt_fsm_param):
+                    tlv = _read_tlv(mt_fsm_param, off)
+                    if not tlv: break
+                    tag, _, vs, ve, off = tlv
+                    if tag == 0x04 and (ve - vs) >= 10:
+                        sm_rp_ui = mt_fsm_param[vs:ve]
+                        self.log_info("MT-FSM detect: Fallback OCTET STRING taken as sm-RP-UI")
+                        break
+
+            if not sm_rp_ui or len(sm_rp_ui) == 0:
+                self.log_info("MT-FSM detect: sm-RP-UI not found -> FINAL (single segment)")
+                return True
+
+            # --- 2) RP-DATA present? -> extract TPDU from RP-User (IEI=0x04), skip 1-byte inner TPDU length ---
+            rpdu_detected = False
+            rp_user_len = None
+            tpdu = sm_rp_ui
+
+            # RP-DATA message type: low 6 bits == 0x01 (e.g., 0x41)
+            if len(sm_rp_ui) >= 3 and (sm_rp_ui[0] & 0x3F) == 0x01:
+                rpdu_detected = True
+                i = 2  # skip RP-MTI and RP-MR
+                while i + 2 <= len(sm_rp_ui):
+                    iei = sm_rp_ui[i]; i += 1
+                    if i >= len(sm_rp_ui): break
+                    ie_len = sm_rp_ui[i]; i += 1
+                    if i + ie_len > len(sm_rp_ui): break
+                    ie_val = sm_rp_ui[i:i+ie_len]; i += ie_len
+                    if iei == 0x04:  # RP-User data
+                        if len(ie_val) >= 1:
+                            rp_user_len = ie_val[0]
+                            # Use indicated length if sane, else fallback to remainder
+                            if 1 + rp_user_len <= len(ie_val):
+                                tpdu = ie_val[1:1+rp_user_len]
+                            else:
+                                tpdu = ie_val[1:]
+                        break
+
+            if len(tpdu) == 0:
+                self.log_info("MT-FSM detect: Empty TPDU after RPDU extraction -> FINAL")
+                return True
+
+            # --- 3) Parse SMS-DELIVER TPDU to reach UDH (authoritative concat) ---
+            fo = tpdu[0]
+            mti = fo & 0x03          # 0 = SMS-DELIVER (downlink)
+            udhi = (fo & 0x40) != 0  # UDHI flag
+
+            # Diagnostics
+            self.log_info(
+                "MT-FSM detect: rpdu=%s rp_user_len=%s tpdu_len=%d FO=0x%02X (MTI=%d, UDHI=%s) "
+                "smrpui[0:24]=%s tpdu[0:24]=%s"
+                % (str(rpdu_detected),
+                   str(rp_user_len) if rp_user_len is not None else "n/a",
+                   len(tpdu), fo, mti, str(udhi),
+                   sm_rp_ui[:24].hex(), tpdu[:24].hex())
+            )
+
+            # Only SMS-DELIVER is expected in MT-FSM; if not, assume single segment
+            if mti != 0x00:
+                self.log_info("MT-FSM decision: non-DELIVER TPDU -> FINAL (send TCAP END)")
+                return True
+
+            # If no UDH -> no concatenation -> single segment -> FINAL
+            if not udhi:
+                self.log_info("MT-FSM decision: UDHI=0 -> FINAL (single segment, send TCAP END)")
+                return True
+
+            # Walk the SMS-DELIVER fixed fields to the start of TP-UD.
+            # NOTE: Do NOT use TP-UDL as octet bound (7-bit uses septets). We only need UDH at start of TP-UD.
+            idx = 1
+            if idx >= len(tpdu):
+                self.log_info("MT-FSM decision: truncated TPDU (OA len) -> FINAL")
+                return True
+            oa_len_digits = tpdu[idx]; idx += 1
+
+            if idx >= len(tpdu):
+                self.log_info("MT-FSM decision: truncated TPDU (TOA) -> FINAL")
+                return True
+            toa = tpdu[idx]; idx += 1
+
+            addr_bytes = (oa_len_digits + 1) // 2
+            if idx + addr_bytes > len(tpdu):
+                self.log_info("MT-FSM decision: truncated TPDU (OA digits) -> FINAL")
+                return True
+            idx += addr_bytes
+
+            # PID, DCS
+            if idx + 2 > len(tpdu):
+                self.log_info("MT-FSM decision: truncated TPDU (PID/DCS) -> FINAL")
+                return True
+            pid = tpdu[idx]; dcs = tpdu[idx+1]; idx += 2
+
+            # SCTS (7 octets)
+            if idx + 7 > len(tpdu):
+                self.log_info("MT-FSM decision: truncated TPDU (SCTS) -> FINAL")
+                return True
+            scts = tpdu[idx:idx+7]; idx += 7
+
+            # UDL (we will not use it to bound octets; read UDH directly from bytes available)
+            if idx >= len(tpdu):
+                self.log_info("MT-FSM decision: truncated TPDU (UDL) -> FINAL")
+                return True
+            udl = tpdu[idx]; idx += 1
+
+            # Start of TP-UD:
+            if idx >= len(tpdu):
+                self.log_info("MT-FSM decision: no TP-UD bytes -> FINAL")
+                return True
+
+            # We only need UDH: ensure we have UDHL + UDH bytes available in the remaining TPDU,
+            # without relying on UDL being an octet count (it may be septets).
+            ud = tpdu[idx:]  # bytes available for UD (may be larger than actual UD bytes if malformed)
+            if len(ud) < 1:
+                self.log_info("MT-FSM decision: empty UD -> FINAL")
+                return True
+
+            udhl = ud[0]
+            if 1 + udhl > len(ud):
+                self.log_info(f"MT-FSM decision: invalid UDH length (UDHL={udhl}, avail={len(ud)-1}) -> FINAL")
+                return True
+
+            udh = ud[1:1+udhl]
+
+            # Parse UDH IEs for concatenation (authoritative)
+            seq = None
+            total = None
+            p = 0
+            while p + 2 <= len(udh):
+                iei = udh[p]; p += 1
+                ielen = udh[p]; p += 1
+                if p + ielen > len(udh): break
+                ieval = udh[p:p+ielen]; p += ielen
+                if iei == 0x00 and ielen == 3:
+                    # 8-bit ref: [ref][total][seq]
+                    total = ieval[1]; seq = ieval[2]
+                    break
+                elif iei == 0x08 and ielen == 4:
+                    # 16-bit ref: [ref_hi][ref_lo][total][seq]
+                    total = ieval[2]; seq = ieval[3]
+                    break
+
+            if seq is not None and total is not None:
+                self.log_info(f"MT-FSM UDH concat: parts={total} part={seq}")
+                if 1 <= seq <= total <= 255:
+                    decision = (seq == total)
+                    self.log_info("MT-FSM decision: concat -> %s"
+                                  % ("FINAL (send TCAP END)" if decision else "NOT FINAL (send CONTINUE)"))
+                    return decision
+                else:
+                    self.log_info("MT-FSM decision: concat values invalid -> FINAL (send TCAP END)")
+                    return True
+
+            # No concat IE inside UDH -> treat as single segment -> FINAL
+            self.log_info("MT-FSM decision: UDH present but no concat IE -> FINAL (send TCAP END)")
+            return True
+
+        except Exception as e:
+            self.log_error(f"Error analyzing MT-FSM parameters: {e}")
+            self.log_info("MT-FSM decision: error path -> FINAL (send TCAP END)")
+            return True
+
+ 
     def create_sri_sm_response(self, invoke_id, msisdn, orig_transaction_id):
         """Create MAP SRI-SM ReturnResultLast within TCAP END (with Dialogue Portion AARE)."""
         self.log_debug("=" * 50)
@@ -1519,52 +1993,83 @@ class MAPSIGTRANServer:
             import traceback
             self.log_error(f"Traceback: {traceback.format_exc()}")
 
+
+    def create_tcap_continue_response(self, orig_transaction_id):
+        """Create TCAP CONTINUE response with OTID and DTID = OTID for dialogue establishment"""
+        try:
+            self.log_debug("=" * 50)
+            self.log_debug("Creating TCAP CONTINUE Response:")
+            self.log_debug(f"  Original Transaction ID: {orig_transaction_id.hex() if orig_transaction_id else 'None'}")
+ 
+
+            # CORRECT (what it should be):
+            new_otid = struct.pack('!I', random.randint(0x10000000, 0xFFFFFFFF))  # Generate new OTID
+            otid = self.encode_asn1_tag_length(0x48, new_otid)                    # New OTID for responder
+            dtid = self.encode_asn1_tag_length(0x49, orig_transaction_id)         # DTID = incoming BEGIN's OTID
+
+
+            # Build Dialogue Portion (AARE) - use generic application context
+            dialogue_portion = self._build_tcap_dialogue_portion_aare("0.4.0.0.1.0.25.3")  # ShortMsgMT-RelayContext-v3
+            
+            # TCAP CONTINUE: Tag 0x65 with otid + dtid + dialoguePortion
+            tcap_continue_data = otid + dtid + dialogue_portion
+            tcap_continue = self.encode_asn1_tag_length(0x65, tcap_continue_data)  # TC-CONTINUE
+
+            self.log_debug(f"  TCAP Continue message created: {len(tcap_continue)} bytes")
+            self.log_debug(f"  Complete TCAP Continue: {tcap_continue.hex()}")
+            self.log_debug("=" * 50)
+            return tcap_continue
+
+        except Exception as e:
+            self.log_error(f"Error creating TCAP CONTINUE response: {e}")
+            return None
+            
     def handle_sccp_udt(self, sccp_data, orig_pc, dest_pc, conn, addr):
         """Handle SCCP UDT message"""
         try:
             if len(sccp_data) < 5:
                 self.log_error("SCCP UDT data too short")
                 return
-                
+                    
             protocol_class = sccp_data[1]
             addresses, tcap_offset = self.parse_sccp_addresses(sccp_data, 3)
-            
+                
             if tcap_offset < len(sccp_data):
                 tcap_data = sccp_data[tcap_offset+3:]
-               
+                   
 
                 transaction_id, invoke_id, op_code, msisdn, _ = self.parse_tcap_message(tcap_data)
 
 
-               
+                   
                 if invoke_id is not None and isinstance(op_code, int):
                     if op_code == MAP_SRI_SM and msisdn:
                       op_code_description = "sendRoutingInfoForSM"
-                      self.log_info(f"Incomig request : {op_code_description}  ")
+                      self.log_info(f"Incoming request : {op_code_description}  ")
                       self.log_info(f"--------------------  Prepare SRI-SM Response -------------------------  ")
                       response_tcap = self.create_sri_sm_response(invoke_id, msisdn, transaction_id)
                       sccp_response = self.create_sccp_response(addresses['calling'], addresses['called'], response_tcap) 
-                  
                       
+                        
                     elif op_code == MAP_MT_FSM:
                       op_code_description = "mt-forwardSM"
-                      self.log_info(f"Incomig request : {op_code_description}  ")
+                      self.log_info(f"Incoming request : {op_code_description}  ")
                       self.log_info(f"--------------------  Prepare MT-FSM Response -------------------------  ")
-                      response_tcap = self.create_mt_fsm_response(invoke_id, op_code, transaction_id)
+                      response_tcap = self.create_mt_fsm_response(invoke_id, op_code, transaction_id,tcap_data)
                       sccp_response = self.create_sccp_response(addresses['calling'], addresses['called'], response_tcap) 
-                      
-                      
+                          
+                          
                     else:
                       sccp_response = None
 
-                    
+                        
                     if sccp_response:
                         m3ua_response = self.create_m3ua_data_message(
                             orig_pc, dest_pc, sccp_response, si=3, ni=CONFIG['network_indicator'], mp=0, sls=0
                         )
                         if m3ua_response:
                             response_data = m3ua_response.pack()
-                            
+                                
 
                             try:
                                 bytes_sent = conn.send(response_data)
@@ -1581,15 +2086,50 @@ class MAPSIGTRANServer:
                             self.log_error("Failed to create M3UA response")
                     else:
                         self.log_error("Failed to create SCCP response")
-                 
+                
+                elif transaction_id is not None:  # Check TCAP message type first
+                    tcap_tag = tcap_data[0] if len(tcap_data) > 0 else None
+                    if tcap_tag == TCAP_BEGIN:  # 0x62 - Only respond to BEGIN
+                        self.log_info("Incoming request: TCAP BEGIN (dialogue establishment)")
+                        self.log_info("--------------------  Prepare TCAP CONTINUE Response -------------------------")
+                        response_tcap = self.create_tcap_continue_response(transaction_id)
+                        if response_tcap:
+                            sccp_response = self.create_sccp_response(addresses['calling'], addresses['called'], response_tcap)
+                            if sccp_response:
+                                m3ua_response = self.create_m3ua_data_message(
+                                    orig_pc, dest_pc, sccp_response, si=3, ni=CONFIG['network_indicator'], mp=0, sls=0
+                                )
+                                if m3ua_response:
+                                    response_data = m3ua_response.pack()
+                                    try:
+                                        bytes_sent = conn.send(response_data)
+                                        if bytes_sent == len(response_data):
+                                            self.log_info(f"{CONFIG['local_pc']} → {CONFIG['remote_pc']} TCAP CONTINUE (DTID = OTID)")
+                                        else:
+                                            self.log_error(f"✗ Partial send: {bytes_sent}/{len(response_data)} bytes")
+                                    except Exception as e:
+                                        self.log_error(f"✗ Failed to send TCAP CONTINUE: {e}")
+                                else:
+                                    self.log_error("Failed to create M3UA response for TCAP CONTINUE")
+                            else:
+                                self.log_error("Failed to create SCCP response for TCAP CONTINUE")
+                        else:
+                            self.log_error("Failed to create TCAP CONTINUE response")
+                    elif tcap_tag == TCAP_ABORT:  # 0x67 - Log ABORT but don't respond
+                        self.log_info("Received TCAP ABORT - no response required")
+                    elif tcap_tag == TCAP_END:  # 0x64 - Log END but don't respond
+                        self.log_info("Received TCAP END - no response required")
+                    else:
+                        self.log_info(f"Received TCAP message type 0x{tcap_tag:02x} - no response generated")
 
                 else:
-                    self.log_error("Could not extract invoke_id or MSISDN from TCAP message")
+                    self.log_error("Could not extract invoke_id or transaction_id from TCAP message")
             else:
                 self.log_error("No TCAP data found in SCCP UDT")
-                
+                    
         except Exception as e:
             self.log_error(f"Error handling SCCP UDT: {e}")
+     
 
     def handle_client(self, conn, addr):
         """Handle client connection"""
