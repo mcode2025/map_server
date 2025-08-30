@@ -2169,56 +2169,515 @@ class MAPSIGTRANServer:
             except:
                 pass
             self.log_info(f"Connection closed with {addr[0]}:{addr[1]}")
-    
+
+    def _pick_active_conn(self):
+        """
+        Select the first ASP-ACTIVE association and return (conn, addr).
+
+        Returns
+        -------
+        (socket.socket, tuple) | (None, None)
+            The connection socket and its address tuple (ip, port), or (None, None)
+            if no suitable association is available.
+        """
+        try:
+            # Prefer an ASP-ACTIVE association
+            for key, info in self.asp_states.items():
+                if info.get('state') == 'ASP-ACTIVE' and info.get('conn'):
+                    return info['conn'], info.get('addr')
+
+            # Fallback: any known connection (not active yet)
+            for key, info in self.asp_states.items():
+                if info.get('conn'):
+                    if self.log_level == 'DEBUG':
+                        self.log_debug(f"_pick_active_conn: no ASP-ACTIVE; falling back to {key} (state={info.get('state')})")
+                    return info['conn'], info.get('addr')
+
+            # None available
+            return None, None
+        except Exception as e:
+            self.log_error(f"_pick_active_conn error: {e}")
+            return None, None
+            
+    def _send_sccp_tcap_on_active(self, tcap_data: bytes, called_gt: str, calling_gt: str) -> bool:
+        """
+        Send TCAP (e.g., BEGIN with MAP MO-FSM) using SCCP + M3UA on the first ASP-ACTIVE association.
+        This version reuses the existing SCCP builder to avoid XUDT pointer/length pitfalls.
+        """
+        # 1) Pick an active association
+        conn, addr = self._pick_active_conn()
+        if not conn:
+            self.log_error("No ASP-ACTIVE association available. Wait for peer ASPUP/ASPAC.")
+            return False
+
+        # 2) Validate addressing inputs
+        if not called_gt:
+            self.log_error("Missing called_gt (destination GT). Set CONFIG['remote_gt'] or provide --smsc.")
+            return False
+        if not calling_gt:
+            self.log_error("Missing calling_gt (origin GT). Set CONFIG['msc_gt'] / ['hlr_gt'] / ['local_gt'].")
+            return False
+
+        # 3) SCCP addresses (SSN defaults to 8 for MSC/SMSC)
+        called_ssn = int(CONFIG.get('called_ssn', 8))
+        calling_ssn = int(CONFIG.get('calling_ssn', 8))
+
+        try:
+            called = SCCPAddress(gt=called_gt, ssn=called_ssn)
+            calling = SCCPAddress(gt=calling_gt, ssn=calling_ssn)
+
+            # Reuse your existing SCCP builder (used successfully for SRI-SM)
+            sccp_pdu = self.create_sccp_response(calling.__dict__, called.__dict__, tcap_data)
+            if not sccp_pdu:
+                self.log_error("Failed to build SCCP PDU for MO-FSM.")
+                return False
+        except Exception as e:
+            self.log_error(f"SCCP build error: {e}")
+            return False
+
+        # 4) Wrap in M3UA DATA
+        try:
+            m3ua_msg = self.create_m3ua_data_message(
+                dest_pc=CONFIG['remote_pc'],
+                orig_pc=CONFIG['local_pc'],
+                sccp_data=sccp_pdu,
+                si=3,  # SCCP
+                ni=CONFIG.get('network_indicator', 2),
+                mp=0,
+                sls=0
+            )
+            if not m3ua_msg:
+                self.log_error("Failed to construct M3UA DATA message.")
+                return False
+            raw = m3ua_msg.pack()
+        except Exception as e:
+            self.log_error(f"M3UA build error: {e}")
+            return False
+
+        # 5) Send
+        try:
+            conn.sendall(raw)
+            self.log_info(f"{CONFIG['local_pc']} → {CONFIG['remote_pc']} M3UA DATA (SCCP + TCAP) sent")
+            if self.log_level == 'DEBUG':
+                self.log_debug(f"Outgoing M3UA DATA hex: {raw.hex()}")
+            return True
+        except Exception as e:
+            self.log_error(f"Send error on active association {addr[0]}:{addr[1]}: {e}")
+            return False
+            
+    def create_mo_fsm_invoke(self, oa_str: str, da_str: str, text: str, smsc_str: str = None) -> bytes:
+        """
+        Build TCAP BEGIN carrying MAP mo-forwardSM (opCode 46) with corrected encoding and validation:
+        - RP-MO-DATA uses 24.011 IEI TLVs (0x00 RP-OA, 0x01 RP-DA, 0x04 RP-User), rp_mti=0x01 (RP-DATA (MO)).
+        - TPDU is SMS-SUBMIT: FO=0x01 (no TP-VP), TP-PID=0, TP-DCS=0 (GSM 7-bit).
+        - TP-DA strictly per 23.040 (len=digits, TOA=0x80|(TON<<4)|NPI, TBCD digits).
+        - Validates OA/DA digits are non-empty to avoid misalignment (PID/DCS shift).
+        - Adds INFO/DEBUG logs for TPDU header fields and MAP/RP parts.
+        """
+        # -------- helpers (local) --------
+        def _digits_only(s: str) -> str:
+            return ''.join(ch for ch in s if ch.isdigit())
+
+        def _parse_ton_npi_digits(s: str):
+            parts = s.split('.')
+            if len(parts) >= 3:
+                ton = int(parts[0]); npi = int(parts[1]); digits = _digits_only(''.join(parts[2:]))
+            else:
+                ton, npi, digits = 1, 1, _digits_only(s)
+            return ton, npi, digits
+
+        def _ensure_digits(label: str, digits: str):
+            if not digits:
+                raise ValueError(f"{label} has no digits after sanitization; TP-DA/TP-OA cannot be empty.")
+
+        def _build_address_string(ton: int, npi: int, digits: str) -> bytes:
+            # AddressString (MAP/RP): TOA ext=1 (0x80) | TON | NPI, then TBCD digits
+            toa = 0x80 | ((ton & 0x07) << 4) | (npi & 0x0F)
+            return bytes([toa]) + self.encode_bcd_digits(digits)
+ 
+
+        def _gsm7_pack(text: str) -> bytes:
+                """
+                Pack GSM 7-bit default alphabet septets into octets (3GPP TS 23.038).
+                Produces exactly ceil(7*n/8) bytes for n septets; LSB-first across octets.
+                """
+                septets = [ord(c) & 0x7F for c in text]
+                out = bytearray()
+                acc = 0
+                bits = 0
+                for s in septets:
+                    acc |= (s << bits)   # append 7 bits at current bit offset (LSB-first)
+                    bits += 7
+                    while bits >= 8:
+                        out.append(acc & 0xFF)
+                        acc >>= 8
+                        bits -= 8
+                if bits > 0:
+                    out.append(acc & 0xFF)
+                return bytes(out)
+        
+     
+        def _gsm7_septet_len(s: str) -> int:
+            """
+            Return TP-UDL (septet count) for GSM 7-bit default alphabet.
+            Extended chars consume 2 septets (ESC + char).
+            """
+            ext = set('^{}\\[~]|€')
+            length = 0
+            for ch in s:
+                length += 2 if ch in ext else 1
+            return length
+
+        def _build_sms_submit_tpdu(da_ton, da_npi, da_digits, text) -> bytes:
+            """
+            TPDU: SMS-SUBMIT with VPF=00 (NO TP-VP field).
+            Order: FO, MR, TP-DA(len,TOA,digits), PID, DCS, UDL, UD
+            """
+            # --- FO bits ---
+            # bit7 TP-RP, bit6 TP-UDHI, bit5 TP-SRR, bits4..3 TP-VPF, bit2 TP-RD, bits1..0 TP-MTI
+            # MTI=01 (SUBMIT), VPF=00 (no VP field)
+            FO = 0x01
+
+            MR = random.randint(0, 255)
+
+            # TP-DA (23.040 §9.1.2.5)
+            da_digits = _digits_only(da_digits)
+            _ensure_digits("TP-DA", da_digits)
+            da_len = len(da_digits)                               # number of digits (not octets)
+            TOA = 0x80 | ((da_ton & 7) << 4) | (da_npi & 0x0F)    # e.g., 0x91 for int'l/E.164
+            da_tbcd = self.encode_bcd_digits(da_digits)           # semi-octet, pad F if odd
+            DA = bytes([da_len, TOA]) + da_tbcd
+
+            PID = 0x00                                            # PID = 0
+            DCS = 0x00                                            # DCS = 0 (GSM 7-bit)
+
+            # UD + UDL
+            UD = _gsm7_pack(text)
+            UDL = _gsm7_septet_len(text)                          # septet count when DCS=0
+
+            # DEBUG: quick header decode
+            if self.log_level == 'DEBUG':
+                self.log_debug(f"TPDU hdr: FO=0x{FO:02X} MR={MR} DA_len={da_len} TOA=0x{TOA:02X} PID=0x{PID:02X} DCS=0x{DCS:02X} UDL={UDL}")
+
+            return bytes([FO, MR]) + DA + bytes([PID, DCS, UDL]) + UD
+
+        def _build_rp_mo_data(da_ton: str,da_npi: str,da_digits: str, tpdu: bytes,text) -> bytes:
+            """
+            RP-MO-DATA (3GPP 24.011):
+            rp-mti (RP-DATA=0x01), rp-mr,
+            RP-DA  AddressString (TOA+TBCD),
+            RP-User IEI(0x04) | L | (TPDU_len | TPDU)
+            """
+            rp_mti = 0x01  # RP-DATA (MO)
+            rp_mr  = random.randint(0, 255)
+
+         
+            # RP-DA (SMSC address)
+            #ton, npi, digits = _parse_ton_npi_digits(smsc_addr_str)
+            #_ensure_digits("RP-DA/SMSC", digits)
+            #da_bytes = _build_address_string(ton, npi, digits)          # TOA + TBCD
+            #self.log_info(f"TPDU DA={ton}.{npi}.{digits}  SMSC='{smsc_str}' (expected DA_len={len(da_digits)})")
+            TOA = 0x80 | ((da_ton & 7) << 4) | (da_npi & 0x0F)    # e.g., 0x91 for int'l/E.164
+            da_tbcd = self.encode_bcd_digits(da_digits)           # semi-octet, pad F if odd
+            #da_len = len(da_digits
+            rp_da_ie = bytes([da_len, TOA]) + da_tbcd
+
+            PID = 0x00                                            # PID = 0
+            DCS = 0x00                                            # DCS = 0 (GSM 7-bit)
+            # RP-User: value = TPDU_len (1 octet) + TPDU
+            rp_user_ie = bytes([len(tpdu)]) + tpdu
+          
+            UD = _gsm7_pack(text)
+            UDL = _gsm7_septet_len(text)                          # septet count when DCS=0
+            self.log_info(f"[MO-FSM] text='{text}' DCS=0x00 UDL={UDL} UD={UD.hex().upper()}")
+            return bytes([rp_mti, rp_mr]) + rp_da_ie + bytes([PID, DCS,UDL]) + UD
+
+        # -------- inputs & validation --------
+        smsc_str = smsc_str or CONFIG.get('smsc_gt') or CONFIG.get('remote_gt')
+        if not smsc_str:
+            raise ValueError("No SMSC address configured (set CONFIG['smsc_gt'] or provide --smsc).")
+
+        oa_ton, oa_npi, oa_digits = _parse_ton_npi_digits(oa_str)  # MO origin MSISDN (MAP sm-RP-OA)
+        da_ton, da_npi, da_digits = _parse_ton_npi_digits(da_str)  # Destination MSISDN in TPDU
+        _ensure_digits("sm-RP-OA/OA", oa_digits)
+        _ensure_digits("TP-DA/DA", da_digits)
+
+        # High-level input echo
+        self.log_info(f"[MO-FSM] Inputs: OA={oa_ton}.{oa_npi}.{oa_digits}  DA={da_ton}.{da_npi}.{da_digits}  SMSC='{smsc_str}' (expected DA_len={len(da_digits)})")
+
+        # -------- Build TPDU (SMS-SUBMIT) and RPDU (RP-MO-DATA) --------
+        tpdu = _build_sms_submit_tpdu(da_ton, da_npi, da_digits, text)
+        self.log_info(f"[MO-FSM] TPDU len={len(tpdu)} hex={tpdu.hex()}")
+
+        # Quick/safe TPDU header dissection to spot DA_len=0 / PID/DCS misalignment
+        try:
+            fo = tpdu[0] if len(tpdu) > 0 else None
+            mr = tpdu[1] if len(tpdu) > 1 else None
+            da_len = tpdu[2] if len(tpdu) > 2 else None
+            idx = 3
+            toa = None
+            da_tbcd = b""
+            if da_len is not None:
+                if da_len == 0:
+                    self.log_error("[MO-FSM] TP-DA length is 0 -> PID/DCS will be misaligned in Wireshark. Check DA digits and sanitization.")
+                elif len(tpdu) > idx:
+                    toa = tpdu[idx]; idx += 1
+                    da_octets = (da_len + 1) // 2
+                    if len(tpdu) >= idx + da_octets:
+                        da_tbcd = tpdu[idx:idx + da_octets]
+                        idx += da_octets
+            pid = tpdu[idx] if len(tpdu) > idx else None
+            dcs = tpdu[idx + 1] if len(tpdu) > idx + 1 else None
+            self.log_info(
+                "[MO-FSM] TPDU hdr: "
+                f"FO=0x{fo:02X} MR={mr} DA_len={da_len} TOA={('0x%02X' % toa) if toa is not None else 'N/A'} "
+                f"PID={(f'0x{pid:02X}' if pid is not None else 'N/A')} DCS={(f'0x{dcs:02X}' if dcs is not None else 'N/A')}"
+            )
+            if da_tbcd:
+                self.log_info(f"[MO-FSM] TP-DA TBCD={da_tbcd.hex()}")
+        except Exception as e:
+            self.log_error(f"[MO-FSM] TPDU header parse error: {e}")
+
+        rpdu = _build_rp_mo_data(da_ton,da_npi,da_digits, tpdu,text)
+        self.log_info(f"[MO-FSM] RPDU len={len(rpdu)} head={rpdu[:24].hex()}...")
+
+        # -------- MAP MO-ForwardSM-Arg --------
+        # sm-RP-DA (MO) = serviceCentreAddressDA [4] => tag 0x84
+        smsc_ton, smsc_npi, smsc_digits = _parse_ton_npi_digits(smsc_str)
+        smsc_addr = _build_address_string(smsc_ton, smsc_npi, smsc_digits)
+        self.log_info(
+            f"[MO-FSM] RP-DA(SMSC): TON={smsc_ton} NPI={smsc_npi} digits='{smsc_digits}' "
+            f"TOA=0x{smsc_addr[0]:02X} TBCD={smsc_addr[1:].hex()}"
+        )
+        sm_rp_da = self.encode_asn1_tag_length(0x84, smsc_addr)
+
+        # sm-RP-OA (MO) = msisdn [2] => tag 0x82
+        oa_addr = _build_address_string(oa_ton, oa_npi, oa_digits)
+        self.log_info(
+            f"[MO-FSM] sm-RP-OA(OA): TON={oa_ton} NPI={oa_npi} digits='{oa_digits}' "
+            f"TOA=0x{oa_addr[0]:02X} TBCD={oa_addr[1:].hex()}"
+        )
+        sm_rp_oa = self.encode_asn1_tag_length(0x82, oa_addr)
+
+        # sm-RP-UI = SignalInfo (OCTET STRING 0x04) containing RP-MO-DATA
+        sm_rp_ui = self.encode_asn1_tag_length(0x04, rpdu)
+        self.log_info(f"[MO-FSM] sm-RP-UI len={len(rpdu)} (RPDU)")
+
+        # Optional IMSI (Universal OCTET STRING) — TBCD digits
+        imsi_param = b""
+        imsi_str = CONFIG.get('imsi')
+        if imsi_str:
+            imsi_tbcd = self.encode_bcd_digits(_digits_only(imsi_str))
+            imsi_param = self.encode_asn1_tag_length(0x04, imsi_tbcd)
+            self.log_info(f"[MO-FSM] IMSI present: digits='{_digits_only(imsi_str)}' TBCD={imsi_tbcd.hex()}")
+
+        mo_arg = sm_rp_da + sm_rp_oa + sm_rp_ui + imsi_param
+        param_seq = self.encode_asn1_tag_length(0x30, mo_arg)  # SEQUENCE wrapper for the invoke parameter
+        self.log_info(
+            f"[MO-FSM] MAP mo-forwardSM-Arg sizes: "
+            f"sm-RP-DA={len(smsc_addr)} sm-RP-OA={len(oa_addr)} RPDU={len(rpdu)} IMSI={len(imsi_param) if imsi_param else 0} "
+            f"param-seq={len(param_seq)}"
+        )
+
+        # -------- TCAP Component: Invoke (opCode = 46 mo-forwardSM) --------
+        invoke_id_enc = self.encode_asn1_tag_length(0x02, bytes([random.randint(1, 127)]))  # INTEGER
+        opcode_local = self.encode_asn1_tag_length(0x02, bytes([46]))  # localValue INTEGER 46
+        invoke = self.encode_asn1_tag_length(0xA1, invoke_id_enc + opcode_local + param_seq)  # [1] Invoke
+        component_portion = self.encode_asn1_tag_length(0x6C, invoke)  # Component Portion
+
+        # -------- TCAP Dialogue (AARQ) with ACN shortMsgMO-RelayContext-v3 --------
+        dialogue_as_id = self._encode_oid("0.0.17.773.1.1.1")  # id-as-dialogue
+        aaq_pv = self.encode_asn1_tag_length(0x80, b"\x07\x80")  # [0] protocol-version (version1)
+        acn_oid = self._encode_oid("0.4.0.0.1.0.21.3")  # shortMsgMO-RelayContext-v3
+        aaq_acn = self.encode_asn1_tag_length(0xA1, acn_oid)  # [1] application-context-name
+        aaq = self.encode_asn1_tag_length(0x60, aaq_pv + aaq_acn)  # AARQ-apdu (APPLICATION 0)
+        external = self.encode_asn1_tag_length(0x28, dialogue_as_id + self.encode_asn1_tag_length(0xA0, aaq))
+        dialogue_portion = self.encode_asn1_tag_length(0x6B, external)  # DialoguePortion
+
+        # -------- TCAP BEGIN --------
+        otid_val = struct.pack("!I", random.randint(0x10000000, 0xFFFFFFFF))
+        otid = self.encode_asn1_tag_length(0x48, otid_val)  # Originating Transaction ID
+        tcap_begin_data = otid + dialogue_portion + component_portion
+        tcap_begin = self.encode_asn1_tag_length(0x62, tcap_begin_data)  # TC-Begin (0x62)
+
+        self.log_info(f"Built MO-FSM Invoke: OA={oa_digits}, DA={da_digits}, SMSC={smsc_str}, text='{text}', DCS=0x00, IMSI={CONFIG.get('imsi','-')}")
+        if self.log_level == 'DEBUG':
+            # Quick sanity bytes: RPDU must start with 01 <MR> 00 00 01 ...
+            self.log_debug(f"MO-FSM RPDU head: {rpdu[:16].hex()}")
+            self.log_debug(f"MO-FSM TPDU hex: {tpdu.hex()}")
+            self.log_debug(f"MO-FSM TCAP BEGIN hex: {tcap_begin.hex()}")
+
+        return tcap_begin
+        
+        
+    def handle_console_command(self, line: str):
+        """
+        Accept console commands.
+
+        Supported:
+          mo <oa-ton.npi.msisdn> <da-ton.npi.msisdn> <text> [--smsc ton.npi.addr]
+            - oa : Originating MSISDN (e.g., 1.1.817085811123)
+            - da : Destination MSISDN for TPDU (e.g., 1.1.817085811456)
+            - text : SMS text (GSM 7-bit by default; see CONFIG['mo_dcs'])
+            - --smsc : Optional SMSC address (ton.npi.digits). Defaults to CONFIG['smsc_gt'].
+
+          exit | quit : stop the server
+          help       : brief usage
+
+        Notes:
+          - Requires create_mo_fsm_invoke() and _send_sccp_tcap_on_active() helpers.
+          - Uses the first ASP-ACTIVE association for sending.
+        """
+        parts = line.strip().split()
+        if not parts:
+            return
+
+        cmd = parts[0].lower()
+
+        if cmd in ('exit', 'quit'):
+            self.stop()
+            return
+
+        if cmd in ('help', '?'):
+            self.log_info("Commands:")
+            self.log_info("  mo <oa-ton.npi.msisdn> <da-ton.npi.msisdn> <text> [--smsc ton.npi.addr]")
+            self.log_info("  mo 1.1.817085811456 1.1.817085811452 test")
+            self.log_info("  exit | quit")
+            return
+
+        if cmd == 'mo':
+            if len(parts) < 4:
+                self.log_error("Usage: mo <oa-ton.npi.msisdn> <da-ton.npi.msisdn> <text> [--smsc ton.npi.addr]")
+                return
+
+            oa = parts[1]
+            da = parts[2]
+
+            # Everything after the second arg is text + optional --smsc
+            smsc = None
+            text_tokens = parts[3:]
+
+            # Support both '--smsc value' and '--smsc=value'
+            for i, tok in enumerate(list(text_tokens)):
+                if tok == '--smsc':
+                    if i + 1 < len(text_tokens):
+                        smsc = text_tokens[i + 1]
+                        del text_tokens[i:i + 2]
+                    else:
+                        self.log_error("Missing value after --smsc")
+                        return
+                    break
+                elif tok.startswith('--smsc='):
+                    smsc = tok.split('=', 1)[1]
+                    del text_tokens[i]
+                    break
+
+            text = ' '.join(text_tokens)
+
+            try:
+                # Build MO-FSM (TCAP BEGIN + MAP Invoke)
+                tcap = self.create_mo_fsm_invoke(oa, da, text, smsc)
+
+                # Decide SCCP GTs: route to remote GT (often SMSC/IWMSC); calling GT is our MSC/HLR
+                called_gt = CONFIG.get('remote_gt') or CONFIG.get('smsc_gt')
+                calling_gt = CONFIG.get('msc_gt') or CONFIG.get('hlr_gt') or CONFIG.get('local_gt')
+
+                if not called_gt:
+                    self.log_error("No called GT available (set CONFIG['remote_gt'] or CONFIG['smsc_gt']).")
+                    return
+                if not calling_gt:
+                    self.log_error("No calling GT available (set CONFIG['msc_gt'] / ['hlr_gt'] / ['local_gt']).")
+                    return
+
+                ok = self._send_sccp_tcap_on_active(tcap, called_gt, calling_gt)
+                if not ok:
+                    self.log_error("MO-FSM send failed (no ASP-ACTIVE or send error).")
+            except Exception as e:
+                self.log_error(f"MO command error: {e}")
+            return
+
+        self.log_error(f"Unknown command: {cmd}. Type 'help' for commands.")
+        
     def start(self):
-        """Start the enhanced MAP SIGTRAN server"""
+        """Start the enhanced MAP SIGTRAN server with console command support"""
         try:
             if not self.check_sctp_support():
                 return
-            
+
             self.socket = self.create_socket()
             if not self.socket:
                 return
-            
+
             self.socket.bind((self.host, self.port))
             self.socket.listen(5)
-            
+            # Make accept() non-blocking with a finite timeout so we can loop
+            try:
+                self.socket.settimeout(1.0)
+            except Exception:
+                pass
+
             if self.log_level in ['INFO', 'DEBUG']:
                 self.log_info("=" * 60)
                 self.log_info(f"Enhanced MAP SIGTRAN Server listening on {self.host}:{self.port}")
                 self.log_info("Features:")
-                self.log_info("  - MAP SRI-SM request handling")
-                self.log_info("  - SRI-SM response with NNN and IMSI")
-                self.log_info("  - Wireshark-like PDU logging")
-                self.log_info("  - M3UA/SCCP/TCAP/MAP stack support")
+                self.log_info(" - MAP SRI-SM request handling")
+                self.log_info(" - SRI-SM response with NNN and IMSI")
+                self.log_info(" - Wireshark-like PDU logging")
+                self.log_info(" - M3UA/SCCP/TCAP/MAP stack support")
+                self.log_info(" - Console commands: 'mo <oa-ton.npi.msisdn> <da-ton.npi.msisdn> <text> [--smsc ton.npi.addr]'")
+                self.log_info("  mo 1.1.817085811456 1.1.817085811452 test")
                 self.log_info("=" * 60)
-            
+
             self.running = True
-            
+
+            # --- Console input loop (runs in background) ---
+            def _console_loop():
+                while self.running:
+                    try:
+                        line = sys.stdin.readline()
+                        if not line:
+                            time.sleep(0.05)
+                            continue
+                        self.handle_console_command(line)
+                    except Exception as e:
+                        self.log_error(f"Console error: {e}")
+                        time.sleep(0.2)
+
+            console_thread = threading.Thread(target=_console_loop, daemon=True)
+            console_thread.start()
+
+            # --- Accept incoming SCTP associations ---
             while self.running:
                 try:
                     conn, addr = self.socket.accept()
                     self.log_info(f"New SCTP connection from {addr[0]}:{addr[1]}")
-                    
+
+                    # Remember this conn so MO sender can use an ASP-ACTIVE association
+                    conn_key = f"{addr[0]}:{addr[1]}"
+                    self.asp_states.setdefault(conn_key, {})
+                    self.asp_states[conn_key]['conn'] = conn
+                    self.asp_states[conn_key]['addr'] = addr
+
                     client_thread = threading.Thread(
                         target=self.handle_client,
-                        args=(conn, addr)
+                        args=(conn, addr),
+                        daemon=True
                     )
-                    client_thread.daemon = True
                     client_thread.start()
-                
+
                 except socket.timeout:
                     continue
                 except socket.error as e:
                     if self.running:
                         self.log_error(f"Accept error: {e}")
                     break
-        
+
         except Exception as e:
             self.log_error(f"Failed to start server: {e}")
         finally:
             self.cleanup()
-    
+            
+ 
     def stop(self):
         """Stop the server"""
         self.log_info("Stopping Enhanced MAP SIGTRAN server...")
